@@ -1,0 +1,17 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/decode.py b/src/tensorfold/families/glm5_next/cuda/decode.py
+index 9d566f1..c1bd2ed 100644
+--- a/src/tensorfold/families/glm5_next/cuda/decode.py
++++ b/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -233,6 +233,12 @@ class Engine:
+         self.draft_n = w.head.n
+         self.graphs = None
+         self.replays = {"main": 0, "sparse": 0, "mtp": 0, "sparse_mtp": 0, "eager": 0}   # steps by path
++        if __import__("os").environ.get("TF_MEMORY_LOG", "0") == "1":
++            torch.cuda.synchronize()
++            free, total = torch.cuda.mem_get_info()
++            print(__import__("json").dumps(dict(event="before_graph_warmup", rank=w.rank,
++                  free_bytes=free, total_bytes=total, allocated_bytes=torch.cuda.memory_allocated(),
++                  reserved_bytes=torch.cuda.memory_reserved())), flush=True)
+         if graphs:
+             from .graphs import Graphs
+ 

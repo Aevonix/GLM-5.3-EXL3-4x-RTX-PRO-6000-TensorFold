@@ -1,0 +1,54 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/host_tier.py b/src/tensorfold/families/glm5_next/cuda/host_tier.py
+index 99c22b7c..9e1131d1 100644
+--- a/src/tensorfold/families/glm5_next/cuda/host_tier.py
++++ b/src/tensorfold/families/glm5_next/cuda/host_tier.py
+@@ -136,6 +136,7 @@ class HostTier:
+         self.clear()
+ 
+     def stats(self):
+-        return dict(bytes=self.held, budget_bytes=self.budget, entries=len(self.entries),
+-                    hits=self.hits, misses=self.misses, evictions=self.evictions,
+-                    pressure=self.pressure, allocation_failures=self.failed)
++        with self.lock:
++            return dict(bytes=self.held, budget_bytes=self.budget, entries=len(self.entries),
++                        hits=self.hits, misses=self.misses, evictions=self.evictions,
++                        pressure=self.pressure, allocation_failures=self.failed)
+diff --git a/src/tensorfold/families/glm5_next/cuda/paged_cp.py b/src/tensorfold/families/glm5_next/cuda/paged_cp.py
+index 326db447..7eece510 100644
+--- a/src/tensorfold/families/glm5_next/cuda/paged_cp.py
++++ b/src/tensorfold/families/glm5_next/cuda/paged_cp.py
+@@ -85,21 +85,28 @@ class PagedSection:
+     def is_contiguous(self):
+         return True
+ 
+-    def _piece(self, a, b):
++    def _bounds(self, a, b):
+         if not 0 <= a <= b <= self.numel() * self.element_size():
+             raise ValueError('snapshot byte range outside section')
+         width = self.view.tensor[0].numel() * self.element_size()
+         lo, hi = a // width, -(-b // width)
+-        rows = self.view.gather(hi - lo, lo)
+-        return rows, lo, a - lo * width, b - lo * width
++        return lo, hi, width, a - lo * width, b - lo * width
+ 
+     def read_bytes(self, a, b):
+-        rows, _, start, end = self._piece(a, b)
++        lo, hi, _, start, end = self._bounds(a, b)
++        rows = self.view.gather(hi - lo, lo)
+         return rows.reshape(-1).view(torch.uint8)[start:end]
+ 
+     def write_bytes(self, a, value):
+-        rows, lo, start, end = self._piece(a, a + value.numel())
+-        rows.reshape(-1).view(torch.uint8)[start:end].copy_(value)
++        lo, hi, width, start, end = self._bounds(a, a + value.numel())
++        rows = self.view.tensor.new_empty((hi - lo, *self.shape[1:]))
++        # Whole overwritten rows need no read of the destination. Only the two
++        # checksum-piece boundaries can contain bytes belonging to another piece.
++        if start:
++            rows[:1].copy_(self.view.gather(1, lo))
++        if end % width and (not start or hi - lo > 1):
++            rows[-1:].copy_(self.view.gather(1, hi - 1))
++        rows.reshape(-1).view(torch.uint8)[start:end].copy_(value, non_blocking=self.is_cuda)
+         self.view.write(lo, rows)
+ 
+ 

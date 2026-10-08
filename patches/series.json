@@ -1,0 +1,908 @@
+[
+  {
+    "path": "aevonix/0000-glm-exl3-route.patch",
+    "sha256": "0c8a769c5890a94dc4ef174600c45b235775d6ddbf9801b15758758521314ff4",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0001-glm-exl3-prompt-experts.patch",
+    "sha256": "edc86d34101f5f7299b702d9d943509088cf53932bc4982f33fa62559e6a601d",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0002-glm-dense-fp8.patch",
+    "sha256": "e91f9764fdccf24b4a494f8d0b7cb89ee813bdaa09de7f6d3232b64f707cb61d",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0003-glm-vision.patch",
+    "sha256": "ea0848e1431c3df3849e61890ef5f56ff4b7a0e0074180a4346e1716e2843d35",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0004-glm-prompt-kernels.patch",
+    "sha256": "18c5f543bdfd145fd40dc82e3545fb62390929280a9ecc8328fa3d5947504737",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0005-glm-dense-q4.patch",
+    "sha256": "569d665d11f6d8f2bddb1c04ef9bbda8d9f9ebb7260262f575b3de4747bf1ddc",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0006-cuda-roce-allgather.patch",
+    "sha256": "88b6b3ffc7d79af9b349988b3b71e5d232d9eaf1d4e6048e98b291002324aff4",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0007-glm-copy-drafts.patch",
+    "sha256": "47bd9edec681db88875183002f8fefb23a44fb156748b1208be611561b2ca402",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0008-glm-prompt-grid.patch",
+    "sha256": "637dcd3bf878b63a734c9768d011b69d478c93ce05408a192f24c5e72836a0f2",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0009-glm-prefill-kernels.patch",
+    "sha256": "895ac7041d0dc969b124829e5765924946165992a323ed8476267390886325cf",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0010-glm-hc-split.patch",
+    "sha256": "e8869b3901ab7bcdb445f2138284302fb3cfb366bc3ee6ec6a313133120d246c",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0011-glm-draft-sim.patch",
+    "sha256": "b41fa0c3881edb21fd379d3c49c2eb5877b6c714b9b49cf775405a261aaff0b7",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0012-glm-kda-chunked.patch",
+    "sha256": "16e196ad89b76c9feb654c5e5abd78b6ab36e687957a772fc6e438c7402677f8",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0013-glm-decode-rounds.patch",
+    "sha256": "81d8cec83adeb3342444f3374b4165c298c7c1dc97c353ad46945dac848cc24f",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0014-glm-kda-chunked-gb10.patch",
+    "sha256": "fded3f2cf26fadf827117620a5264557ef1afd94202d95d3d93d7814ab97394d",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0015-glm-shared-prefix.patch",
+    "sha256": "776aae89511213158cb03e614d369f3df1dad071853f4776b14787c7c6d52e6a",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0016-glm-decode-kernels.patch",
+    "sha256": "b78f78234d974ea945a85b04768a2f2f17f4015f5da36c0fe0bf9916f3c13e96",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0017-glm-overlap-priority.patch",
+    "sha256": "c0a0698de741c727c4e639b38adb2a53a7ab040c1f0feebd2d57f59f5cf621e3",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0018-glm-noise-policies.patch",
+    "sha256": "6592e008e0a1660e1d80af179250ec7230fddf4318b5d8c74ca6f865765bca04",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0019-glm-decode-kernels2.patch",
+    "sha256": "af3c5a2ce98c3847046e0bc468eacba6ce39dd8b1e2075a2ca6e561185547e29",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0020-glm-prompt-experts-order.patch",
+    "sha256": "47a3ea494d513fd1940d39a6222faa58eb7e920444c9edfa3747bdb408cce6f2",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0021-glm-dflash-policy-env.patch",
+    "sha256": "64cd15d9dbf6fefa46c8688b245c4b89d8120e9753fd5e7ba9fde51e878c3b00",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0022-glm-overlap-normal-priority.patch",
+    "sha256": "ba6ec21bf892abfbc8126dc4339512236e8a14ea6fa27feafc74f0d73b707bf2",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0024-glm-prompt-select-rows.patch",
+    "sha256": "27d33a55af4970ce060e855e2c80d081c37ae10adbe409a99053c05fddae2364",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0025-glm-dflash2-ring.patch",
+    "sha256": "a866ded3cf5ddf4403b3dbda3ab659f03b36e05261f3b5656ecfb0ea4631cc27",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0026-glm-multi-kda.patch",
+    "sha256": "1eb03ae709d803dae94ff6bb377a82b2fa3831cd51a02abe8885ff02cfb68e2e",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0027-glm-multi-dflash2.patch",
+    "sha256": "83c23b768022f8c6c75e9e21a5ddbfac969c46c875f26cad65e64a83de83f741",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0028-glm-lean-prompt-scratch.patch",
+    "sha256": "3a3dcf6e063814db1ce2ec61ae7eb452673882829394419ecdcfb3a23ee7eb9e",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0029-glm-multi-dsa.patch",
+    "sha256": "764c3ccc7dd4514e0eac31d95fef43e018b1e4eb93406cd420d99528806f4861",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0030-glm-multi-stream-engine.patch",
+    "sha256": "f0d4702708ef8dbf63bc4f01e82de85339753b22aedf42fd38e4fc86ef5d0d1d",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0031-glm-decode-index-regs.patch",
+    "sha256": "d0300cc64041b3e7647b3b5cc04620e18bea7fdac50b8fecba92023608391d16",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0032-glm-code-copy-drafts.patch",
+    "sha256": "277628cfde12a7b523c3c18081201c9bb283b711c64bdd592eecdca2eff7e8f3",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0033-glm-prefill-overlap2.patch",
+    "sha256": "f1a218501d0c5943c47b1573ec47ad58b32aae1a32d76c608117055d60b6ab7a",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0034-cuda-nucleus-union.patch",
+    "sha256": "c38c65a26382c58b727a061657b84677fb83843f72ccc45352c351e1ad17bee9",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0035-glm-multi-rounds.patch",
+    "sha256": "ab0851ae0f052b37e146b7e120e7a2405eb8b0f6a789ee70ce53b8ae2e08e322",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0036-glm-tool-calls.patch",
+    "sha256": "8b13ac39ce035eedeabe3f12984bdc163fe3ff648bba14070d19315aa285ac0e",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0038-glm-kv-fp8.patch",
+    "sha256": "6daa4233272463b0c8c99dba8f747d740255927a3f26d8057f52bac933b32209",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0039-glm-kda-chunked-kernel.patch",
+    "sha256": "8fc8f014bce24b9d07dca74e58b0761e116c805281c545f5dae3a4fb90003541",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0040-glm-parallel-deadlocks.patch",
+    "sha256": "710880fcb25495300b2857ed18b60041193caceac962ab14f997b5f48ceb8608",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0041-glm-parallel-ring-base.patch",
+    "sha256": "c9fb854b44369f7b8574c1e7b9f45ed688e75115d03563269dc9f9bf01aae7b2",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0042-glm-prompt-replay.patch",
+    "sha256": "18a70657550edea02746e6411770edd9f67ef519ab67b61e7c324b7759c3e316",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0043-glm-visible-pools.patch",
+    "sha256": "0b58a80c28ed8eabf8239f8aab21c3c0120444ff1d81aba2a22c9b25da07ba80",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0044-cuda-context-errors.patch",
+    "sha256": "4e8e2c832d8921b7786b2b587a995fb872d9ac7988c4c9d774d1a49392b7b0f6",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0045-cuda-metrics.patch",
+    "sha256": "35688078addc1577117cc1593c2aa277e77431d4ba7faa62e16f492619f0833b",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0046-glm-l2-prefetch.patch",
+    "sha256": "3b67de516075978b0bb1024d96c25e27cb4401bdf269f4bcecf9ba3e93640b66",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0047-glm-exl3-decode-loads.patch",
+    "sha256": "387c5d55584d698c1c66387d0b51efd09c06bfc0b4500d567e2c5d0be8189845",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0048-glm-timing-tokens.patch",
+    "sha256": "a5cf2056c04ae0ddc0e0ef5d2893f6d50769498981550c983d121e6ca88eca93",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0049-glm-multi-prefill.patch",
+    "sha256": "3a0c108582dba4a151938e72a81808690c0759116ed23ed30bab4d4b9cd3b264",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0050-glm-many-media.patch",
+    "sha256": "7b76dc8387691372a26089da67399ec547659a707507b1444e5caf8fb30bd25b",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0051-glm-tool-history-recovery.patch",
+    "sha256": "314666b2cdd2b042c9d540e2a84c2f51487a34e5e35d637bb7415bd616664863",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0052-cuda-roce-startup.patch",
+    "sha256": "04f42483392ce0c7ff1f58691d67d859b05a3559e1a25b47bd3fe37b41e68f21",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0053-glm-whole-tool-calls.patch",
+    "sha256": "be859822bae3a2d05467ff969b14645a7f142bea0f07536a6418dccb61a2c320",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0054-glm-image-prompt-reuse.patch",
+    "sha256": "4b15494e28e0979ef0eb581530abc399e6d2e697ea4bbc287a6572c2ab2b985c",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0055-glm-open-tool-calls.patch",
+    "sha256": "5ef64347096bba436bb6af22613561563529bb93c3031351d83316782dd779a2",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0056-glm-tool-result-media.patch",
+    "sha256": "767136e6271fcce5c206f09c32821eba28844566ea89bb62f6a1af47ec995bce",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0057-server-thinking-alias.patch",
+    "sha256": "286d6b841fe37fc976905416cde6b5ca6bad8a19994ed4c3a76f48d7b1ee1b7e",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0060-glm-keep-thinking.patch",
+    "sha256": "13b7a9ad029580755d6ffe6ecfdde739db2a11bd78c6343b4ee733bbb1f54588",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0061-server-smooth-stream.patch",
+    "sha256": "c0920d7a81f501d3738c028bf61fff5d9b90a0ffe292179a90b32f7fa8e00a29",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0062-glm-sliced-fill.patch",
+    "sha256": "5df7fa5c52b96dfdfa00278fa66b9e1f0a5dba0b6dc176ddb0c5159489230c50",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0063-glm-kept-cap-superseded-first.patch",
+    "sha256": "e7956307fce055be0efa8764e034165153c85e9fb3a3ba522fd527e7c3efd8cd",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0064-glm-split-connect-early.patch",
+    "sha256": "e8792a1f1a06cf5210ed02d4a645b45c455564456b5c6ff3efdb709c60029588",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0065-glm-rank-checks.patch",
+    "sha256": "1d896beb6e8f8b8c962e99626e7522ef0fb9b4687214fe77c612b798d8966e7e",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0066-glm-tp-n.patch",
+    "sha256": "a2bd9a91cdb63dd007d97ac880d0fecb4b32659f1683f1279498c1ba221179ef",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0067-glm-tp3-split-pad.patch",
+    "sha256": "42e47582c05a4c75b4c8ce827fcc35afd58f3ed0af379fb857075a2f2ba5d07f",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0068-glm-tpn-split-buffer-rows.patch",
+    "sha256": "a01c484b11dd5a54b57b47803799a997d6f43698d58f0be9e38e5a8540e3fc97",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0100-glm-full-layout.patch",
+    "sha256": "9e7c3c33b4ed7d35ce8d87dfcd4daf88067cf625d1bd861da14413a734148d66",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0101-glm-full-weights.patch",
+    "sha256": "01454d50fb9ec7ba812a3b92c4b5afccb5f93f1a1e390da4160c3706681ad0f6",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0102-glm-full-dsa.patch",
+    "sha256": "546e7640012563b199301dbadf923aaf414332aea07fa293bed0c46445ef61a8",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0103-glm-full-forward.patch",
+    "sha256": "b92f5f7227f32a13e48154242f6285006f084beaeec82aa55e859897515484f8",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0104-glm-full-engine.patch",
+    "sha256": "90f14d284940bfaabd642911f1a7bd528028eb349809e380ed6d48a1c7678451",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0105-glm-full-prefill.patch",
+    "sha256": "85e3ed7f1513a9ad90dee1795feef129adaa8006f090aec4987d8d64ba3243b5",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0106-glm-full-prompt-experts.patch",
+    "sha256": "0c841c8fc415062a66bd5a7ad6f6fb2b9332f29b6118ef1c78a31998a8e5afd3",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0107-glm-full-row-split.patch",
+    "sha256": "2a0f6fb20ddafbb340b4e95984e3821694f13e023d3031e979382e0687a6bd1d",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0108-glm-full-mia-prompt-experts.patch",
+    "sha256": "3155ebb2331e951f6240cf07cab905e67fd781d8a69b73654c45da3a41dfdb5c",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0109-glm-full-mtp-cost-chain.patch",
+    "sha256": "e6e1033e7ada0a7807138aa4b8d03cd3e4a04d960795da948e5aff268c664539",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0110-glm-full-mia-sparse-attention.patch",
+    "sha256": "0e505557fbcd8826d5022838f1910aadca78eea08ec5308b3501174018df40e6",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0111-glm-full-q4-tiles.patch",
+    "sha256": "d513f46b6ec1c0decedcedd184532aaab15a5e70fad7d6d83567fc6a30dfbd51",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0112-glm-full-cp-caches.patch",
+    "sha256": "821875e96ba819c93b468efb2bffb395597d0dc6d31c9bb281b0087789ef4434",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0113-glm-full-context-parallel.patch",
+    "sha256": "3f3ee37d91dc62f41eeb66a2492b5461c5322025cdb4985fdec1e66f937d8322",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0114-glm-full-dspark.patch",
+    "sha256": "ffccb620b63890b6ed2e4320e9b5fb822ef9f32a21a541fa72666401b8553f41",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0115-glm-full-kv-fp4.patch",
+    "sha256": "605e660f510ec6adee18fc2de24ba254402141c80d1fd990e093f9d794b1f856",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0116-glm-full-draft-costs.patch",
+    "sha256": "e9b8e2fdb6ff89b40188804ecad8e2312511c00f6d4ce212f6dce4bcea18d74f",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0117-glm-full-dspark-sampling.patch",
+    "sha256": "4ce55e938cc4301c76ea8664b4f4f7f7e09ae47467a617df51ee2a3eb1d2adf0",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0118-glm-full-cp-graphs.patch",
+    "sha256": "f0123cc465e14396c483b9749448f6546fc5e5d4f33ec76d8c65339cbf25a061",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0119-glm-full-text-calibration.patch",
+    "sha256": "9698af4f735e4311d5011bede4e328f3843383fcb88a3fa443c7629d758eafb7",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0120-glm-full-cp-short-select.patch",
+    "sha256": "c26077ff02c75c94944bc91b6d1a6f4afbadb799f32c9743fa7b8e0445446b9d",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0121-glm-full-graph-roce-check.patch",
+    "sha256": "c155b259f556440e6ece7586dd45dc9e17202eb1fe63e1e8af7983ffede26305",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0122-glm-full-serial-stop.patch",
+    "sha256": "adefde746f7e87bb1338c38bbbe9ce945819767137618f9401b40343a9d25966",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0123-glm-full-dspark-dump.patch",
+    "sha256": "233732d2f3ca52f8c41774b5a2c786ab9eb44b811fccc58441553efae0c957be",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0124-glm-full-mem-trace.patch",
+    "sha256": "d19d8865577b56b3c71cd8c453692785da7206461d8cbdfef79c0e5112bc7187",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0125-glm-full-dspark-host-markov.patch",
+    "sha256": "4a715aaf12edf8bf4384803700d96aa32a93378b628f7dea404b42ed45f535e7",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0126-glm-full-calibration-windows.patch",
+    "sha256": "ac3f27346357ef7ebd3a407b4eee4ed5e68fb1bdf68d361725f2e11ad9236331",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0127-glm-full-moe-overlap.patch",
+    "sha256": "ea4c9872d5086a413092fe1a5e22779b7a9f2954c38c06f3ad669460eb810dbb",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0128-glm-full-expert-prefetch.patch",
+    "sha256": "ad9a296c061ba3a5d252f4885683e601c87822bc23917e3aed9895f5877bd30f",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0129-glm-full-cp-prompt-msa.patch",
+    "sha256": "904b414104ac8ad80170977bf13ec6948e3e7784ef99cc067b44c67637996d14",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0130-glm-full-multi-verify.patch",
+    "sha256": "c37b91e2232b390338303d521ea1f88667ddb2ab0aeafa2991285897ac64b7f1",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0131-glm-full-cp-prompt-pipe.patch",
+    "sha256": "0740e5f6c213a1ac4f0dc1eb4817f603b100fe635e06a4f9b5b7de491f748c21",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0132-glm-full-prompt-disk-cache.patch",
+    "sha256": "ab4482cd105e1379706d679b185d0bd4cd4c41dff642bcbd28d48ae1d8d4688e",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0133-glm-full-kv-fp4x.patch",
+    "sha256": "5b11d89c5c657606258a1340bfd816655ecc9de30665fc6d579fca2be2f0d33b",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0134-glm-full-multi-serve.patch",
+    "sha256": "39f656e38e30c0c360462d6e3be12b889f0ad7c2a537b9d6e5a747e5b4b95d4b",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0135-glm-full-cp-prompt-raw-q.patch",
+    "sha256": "faf91adfa46cd78d4da715fa8e9b43f768542e6b1d1844ac6eea7218ba646b31",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0136-glm-full-chunk3k.patch",
+    "sha256": "c6d64e6cdbf113386c5e29c6efb606c3249002dcadf6b5890612fb6955f479e4",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0137-glm-full-kv-fp4x-fix.patch",
+    "sha256": "f1f1e966dba580df6375e0de6173dcaa9f240abd88f6a606f22c0a2ddfb1938c",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0138-glm-full-multi-kernels.patch",
+    "sha256": "dec0a2bf8d22e49096a2c01d6487572ca9718e109177b0d11730ce663ba61c3f",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0139-glm-full-multi-graphs.patch",
+    "sha256": "9ca713e681657e6c22140e8971979b99580a988ff0aaf6fa23b4638936b0d563",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0140-glm-full-copy-hybrid.patch",
+    "sha256": "fb32117d6ba47bf5962097d5bf52fbab661bbbfed0fc8a89821d873477804ff5",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "miaai-lab/0141-glm-full-cp-kv-gather.patch",
+    "sha256": "c4649d6032e97bd5f889305663ccdf7f147d8070c6d31cdd2a373ea27b16f0bc",
+    "strip": 0,
+    "cwd": "src"
+  },
+  {
+    "path": "aevonix/aevonix-mia-100-server-contract.patch",
+    "sha256": "342babbe3f969c3847be3dce8c5fd3f6b57f8803b6fdaa47f973ca75a62637cc",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-120-communicator.patch",
+    "sha256": "8842294c6acea0c0732956d5e276ea39f35c7bd60b13e0870cb1b41a0bee6b12",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-003-before-warmup-memory.patch",
+    "sha256": "4d6c3b60d2d15144c8594b3ceea5a5ba36a7dc5a516d42b3aaaa526401840db2",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-121-server-tests.patch",
+    "sha256": "0a5508db47f9e2d4cef582d7195c65b8fbc5b5044dce14c6aa1c890e22cc639d",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-122-tpn-decisions.patch",
+    "sha256": "80370228a66f7c1d737473f03a2c06f82cb8a364efc4e489532b0273bac08679",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-123-thinking-and-api-fixtures.patch",
+    "sha256": "7e5c7df33ce3fe7b86a13795d78c7a7bf2eab8bdde787c9b2a844f2fb83a5d3b",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-124-test-fixtures.patch",
+    "sha256": "90af825bffef99ff7745ceefb59800a493f544bcdb3cadae4abc54dbcea820da",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-125-capacity-test-fixtures.patch",
+    "sha256": "49d4c629ce627f4e2a2e3c581126d4d1af5e65cfd1f8dc4a38b4ad69c524dcdd",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-126-tpn-startup-and-diagnostics.patch",
+    "sha256": "5d17a3268fb615177cbf7c944fdda9ce149db92d7ce13a6311ad78da18b396cc",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-010-dspark-controls.patch",
+    "sha256": "4907e7efb41ca983aab4d90187bec648f74d0a3662a10b8cefd565c8ba34f497",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-012-nccl-exchange-comm.patch",
+    "sha256": "b93e1c718d8330a07430918fdcf4a63534e6e166190caf802f522956878904f9",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-016-fp8-shape-tiles.patch",
+    "sha256": "3f747c62db6a32ef5c0828fa2cc6613d4635508c14144aa00bb63e86eaf0fb63",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-018-fp8-prompt-tiles.patch",
+    "sha256": "789da6a14c44318928c4524d3cf7825a601a35d91c4490e7efd2a291e0c01627",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-030-v065.patch",
+    "sha256": "262b5cba8368c54ba5b65cc1b789f6f5e5f2073a64a37400e0302bfd3a2eb69d",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-032-v065.patch",
+    "sha256": "4fdce0953132edc075fac24257301ba6292e1e114fbb7c294d36e1a20e4b45be",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-033-v065.patch",
+    "sha256": "1739ca5e52b4c024044fe1f11e148e39c4f7e093629625e8a9a830d88fa7b3c2",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-047-parallel-cp-topk.patch",
+    "sha256": "7e0305b170ca1d1b190993ce358419f53fe404d8d1a61a8ed68e29fdfc9d5a7a",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-046-cp-sparse-chunks.patch",
+    "sha256": "36c1c0ca70168d6cc0da3346872ebf045acf80f232eba31c0327afb397a5e7cf",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-045-index-query-reuse.patch",
+    "sha256": "a9df4360187b054cf888f97bae32ed65302524d0e6a881f50035381e4eee407e",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-060-cp-concurrent-extents.patch",
+    "sha256": "234fd21d912b3fc3022a8f1b51327ab5b3921284e053607f5673b04f18815065",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-061-lean-buffers.patch",
+    "sha256": "aa9cc3906bf0180847717f555c0b4143d1f247de85bfabca1b88b6af60a26372",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-063-paged-cp-reference.patch",
+    "sha256": "b5a779811f07b67db99ec978489188bc5ababf40c38ffe649de3fbe40e401d95",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-130-concurrent-cp-graphs.patch",
+    "sha256": "63a3b29a2d149e832849720df676b6e95d6c9d77277b22429c02b32abbf69c2e",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-017-graph-boundary.patch",
+    "sha256": "6abc4dcd2f350e2cb6df79f5e238bf65f7ae77e6508f21e28816272f91f9816a",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-131-cp-graph-agreement-receipts.patch",
+    "sha256": "0a4be21d14b86c78d9b846b7bca2b8238bae19d6cb5b4a68cf8c47a8e89dcb06",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-132-cp-graph-dynamic-extents.patch",
+    "sha256": "9839b8953bf3ca8e2e3a16b1783bd0ef40e9c072742e026dca685f607d968a11",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-133-cp-graph-row-shapes.patch",
+    "sha256": "6644d51accc0c4edc23b975e2e82cee87a2f234cd4485ca2e1e39dab0617aacf",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-134-five-session-cp-admission.patch",
+    "sha256": "e87d51cd0e64ee2c83144a8bc7dd090522c53167bf9bb53997434a0638b31a68",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-200-cp-graph-buckets.patch",
+    "sha256": "61bf793b22923055bdae0b57f0a712a6ddcf983f7570b925deea301d6f5f7ade",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-201-cp-batch-exchange.patch",
+    "sha256": "9f1a41298af99df150ee763927d38206211e6968a3425263c7a797a2033bc896",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-202-native-paged-cp.patch",
+    "sha256": "5eb842a9e47695140335e2e19df2751f2a7f31b978de1118dd5db300fd47d8aa",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-203-batch-drafting.patch",
+    "sha256": "f81bdaf810a5315cee912e6fa781de457e114354d3ac8aa8d1eb9a66f615bac5",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-260-host-prompt-tier.patch",
+    "sha256": "5b1e190eb29c4f29dac1db76bb604ee67df35e56b558e2f70df859d8f83eb8b7",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-261-concurrent-prompt-parking.patch",
+    "sha256": "4e567342f55ca4e6bc416dcc6ac860c331a2be6f4bbc3843e4e71bda880489f2",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-262-cache-identity-and-telemetry.patch",
+    "sha256": "9c2616a38adea03dc1caecb0f0c3ecaf2422b4d26a57e6431dac91a3faefc3ef",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-263-idle-host-pressure.patch",
+    "sha256": "5fb4654b5f0a55bd74e919a09b2e2ca0aba0a723d6129f162408a072b7f3b759",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-264-retain-restored-prefix.patch",
+    "sha256": "7e99bdf92a75b7e1217fda15aeaeb2185fb1b4e0304e247cdf496b3ab26793ba",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-265-bounded-paged-scatter.patch",
+    "sha256": "b1bd69b5b1ccb49b6ca095ae7b6a615f53a5f8303af2dfeecc2e0b95dca57e31",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-266-launch-cache-identity.patch",
+    "sha256": "5d9948fdb3f14301f726ca0b8a364a3ea5d8db8cf629b4bda4b61053fe3a3186",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-280-vllm-metric-names.patch",
+    "sha256": "c2cfc866b5d38d7c719cfcd5b9832d72443c5918217ef7af29bbf43dfd9988d0",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-221-cp-vector-merge.patch",
+    "sha256": "7616b633781b1b721b5401ee67e6a6ad06797b84171548bcdd3f9ed38104dbb7",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-223-cp-merge-early-exit.patch",
+    "sha256": "03c2738202358c88e30c35f7b7f3deb024e71c313b16099adc7679bf4a50e532",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-235-msa-active-head-tiles.patch",
+    "sha256": "04f3edbbc819edf5aba9098aca75721de79be028b7255fa3a9ed19d56dd8a531",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-236-msa-skip-inactive-qk.patch",
+    "sha256": "18cfe7118a9c8d30568bc6d3a5d3aeddfae618f0377f24c7cd74947305e2c281",
+    "strip": 1,
+    "cwd": "."
+  }
+]

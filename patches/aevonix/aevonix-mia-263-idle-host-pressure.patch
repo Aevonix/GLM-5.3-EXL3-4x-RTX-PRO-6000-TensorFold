@@ -1,0 +1,65 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/host_tier.py b/src/tensorfold/families/glm5_next/cuda/host_tier.py
+index 16667c03..99c22b7c 100644
+--- a/src/tensorfold/families/glm5_next/cuda/host_tier.py
++++ b/src/tensorfold/families/glm5_next/cuda/host_tier.py
+@@ -9,13 +9,24 @@ import threading
+ 
+ 
+ class HostTier:
+-    def __init__(self, budget=0, *, world=1, reserve=48 << 30):
++    def __init__(self, budget=0, *, world=1, reserve=48 << 30, monitor=False):
+         self.budget = max(0, int(budget))
+         self.world, self.reserve = max(1, int(world)), max(0, int(reserve))
+         self.entries = OrderedDict()
+         self.held = 0
+         self.lock = threading.RLock()
+         self.hits = self.misses = self.evictions = self.pressure = self.failed = 0
++        self.stopped = threading.Event()
++        self.monitor = None
++        if monitor and self.budget:
++            self.monitor = threading.Thread(target=self._watch_pressure, name='tf-host-pressure', daemon=True)
++            self.monitor.start()
++
++    def _watch_pressure(self):
++        # Idle GPU-resident conversations must not keep this optional tier alive
++        # under pressure from other services. In-use reads release at completion.
++        while not self.stopped.wait(1.0):
++            self.trim()
+ 
+     @staticmethod
+     def available():
+@@ -118,6 +129,12 @@ class HostTier:
+             self.entries.clear()
+             self.held = 0
+ 
++    def close(self):
++        self.stopped.set()
++        if self.monitor is not None:
++            self.monitor.join()
++        self.clear()
++
+     def stats(self):
+         return dict(bytes=self.held, budget_bytes=self.budget, entries=len(self.entries),
+                     hits=self.hits, misses=self.misses, evictions=self.evictions,
+diff --git a/src/tensorfold/families/glm5_next/cuda/pcache.py b/src/tensorfold/families/glm5_next/cuda/pcache.py
+index 07f18ecf..c4d34d9d 100644
+--- a/src/tensorfold/families/glm5_next/cuda/pcache.py
++++ b/src/tensorfold/families/glm5_next/cuda/pcache.py
+@@ -670,7 +670,7 @@ class DiskCache:
+         from .host_tier import HostTier
+ 
+         self.host_tier = HostTier(int(_env_float("TF_GLM_HOST_CACHE_GIB", 0) * 2 ** 30), world=world,
+-                                  reserve=int(_env_float("TF_GLM_HOST_RESERVE_GIB", 48) * 2 ** 30))
++                                  reserve=int(_env_float("TF_GLM_HOST_RESERVE_GIB", 48) * 2 ** 30), monitor=True)
+         self.writer = Writer(self, depth)
+ 
+     @classmethod
+@@ -900,7 +900,7 @@ class DiskCache:
+         self.writer.drain()
+         self.read_pool.shutdown()
+         self.write_pool.shutdown()
+-        self.host_tier.clear()
++        self.host_tier.close()
+ 
+ 
+ # -- a state back ------------------------------------------------------------------------------------------------------

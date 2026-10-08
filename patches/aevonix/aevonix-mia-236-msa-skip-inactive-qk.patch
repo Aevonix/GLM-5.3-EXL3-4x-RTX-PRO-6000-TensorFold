@@ -1,0 +1,144 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/msa.cu b/src/tensorfold/families/glm5_next/cuda/msa.cu
+index 59d061aa..8ca0cca4 100644
+--- a/src/tensorfold/families/glm5_next/cuda/msa.cu
++++ b/src/tensorfold/families/glm5_next/cuda/msa.cu
+@@ -192,6 +192,13 @@ __global__ void __launch_bounds__(NTHREADS, 1) msa_kernel(
+     // the QK warp grid: head m tile qm (heads 16 qm ..), key pair np (keys 16 np .., two n tiles), K half kh
+     // (latent k steps 16 kh .., rotary steps 32 + 2 kh, + 1); the halves add up through shared memory, kh 0 first
+     const int qm = warp & 1, np = (warp >> 1) & 1, kh = warp >> 2;
++#ifdef MSA_SKIP_EMPTY_QK
++    constexpr int ACTIVE_QH = HEAD_TILES * 16;
++    const bool active_qk = qm < HEAD_TILES;
++#else
++    constexpr int ACTIVE_QH = 32;
++    const bool active_qk = true;
++#endif
+     float* X = reinterpret_cast<float*>(smem + SM_X) + ((size_t)(qm * 2 + np) * 32 + lane) * 16;
+     // the PV warp: output columns 64 warp ..
+     // Omit only output head tiles whose rows the caller never reads.
+@@ -288,47 +295,51 @@ __global__ void __launch_bounds__(NTHREADS, 1) msa_kernel(
+ 
+         // scores^T: warp (qm, np, kh): heads 16 qm .., keys 16 np .. (n tiles j = 0, 1), its K half; latent and
+         // rotary sums apart, two latent chains an n tile
+-        float acc[2][2][4] = {}, accr[2][4] = {};
+-#pragma unroll 4
+-        for (int ks = 16 * kh; ks < 16 * kh + 16; ks += 2) {
+-#pragma unroll
+-            for (int c = 0; c < 2; ++c) {
++        // Inactive head tiles do not feed any live output or normalization.
++        // Keep both K-half chains and their merge order for every live head.
++        float part[16];
++        if (active_qk) {
++            float acc[2][2][4] = {}, accr[2][4] = {};
++    #pragma unroll 4
++            for (int ks = 16 * kh; ks < 16 * kh + 16; ks += 2) {
++    #pragma unroll
++                for (int c = 0; c < 2; ++c) {
++                    uint32_t a[4], bb[4];
++                    ldsm_x4(a, abase + (ks + c) * 16);
++                    ldsm_x4(bb, bbase + (ks + c) * 16);
++                    const uint32_t b0[2] = {bb[0], bb[1]}, b1[2] = {bb[2], bb[3]};
++                    mma_bf16(acc[0][c], a, b0);
++                    mma_bf16(acc[1][c], a, b1);
++                }
++            }
++    #pragma unroll
++            for (int ks = LW / 16 + 2 * kh; ks < LW / 16 + 2 * kh + 2; ++ks) {
+                 uint32_t a[4], bb[4];
+-                ldsm_x4(a, abase + (ks + c) * 16);
+-                ldsm_x4(bb, bbase + (ks + c) * 16);
++                ldsm_x4(a, abase + ks * 16);
++                ldsm_x4(bb, bbase + ks * 16);
+                 const uint32_t b0[2] = {bb[0], bb[1]}, b1[2] = {bb[2], bb[3]};
+-                mma_bf16(acc[0][c], a, b0);
+-                mma_bf16(acc[1][c], a, b1);
++                mma_bf16(accr[0], a, b0);
++                mma_bf16(accr[1], a, b1);
+             }
++    #pragma unroll
++            for (int j = 0; j < 2; ++j)
++    #pragma unroll
++                for (int q = 0; q < 4; ++q) {
++                    part[j * 8 + q] = acc[j][0][q] + acc[j][1][q];
++                    part[j * 8 + 4 + q] = accr[j][q];
++                }
++            if (kh == 1)
++    #pragma unroll
++                for (int q = 0; q < 16; q += 4)
++                    *reinterpret_cast<float4*>(X + q) = make_float4(part[q], part[q + 1], part[q + 2], part[q + 3]);
+         }
+-#pragma unroll
+-        for (int ks = LW / 16 + 2 * kh; ks < LW / 16 + 2 * kh + 2; ++ks) {
+-            uint32_t a[4], bb[4];
+-            ldsm_x4(a, abase + ks * 16);
+-            ldsm_x4(bb, bbase + ks * 16);
+-            const uint32_t b0[2] = {bb[0], bb[1]}, b1[2] = {bb[2], bb[3]};
+-            mma_bf16(accr[0], a, b0);
+-            mma_bf16(accr[1], a, b1);
+-        }
+-        float part[16];                                   // [n tile j][latent 0..3 | rotary 0..3]
+-#pragma unroll
+-        for (int j = 0; j < 2; ++j)
+-#pragma unroll
+-            for (int q = 0; q < 4; ++q) {
+-                part[j * 8 + q] = acc[j][0][q] + acc[j][1][q];
+-                part[j * 8 + 4 + q] = accr[j][q];
+-            }
+-        if (kh == 1)
+-#pragma unroll
+-            for (int q = 0; q < 16; q += 4)
+-                *reinterpret_cast<float4*>(X + q) = make_float4(part[q], part[q + 1], part[q + 2], part[q + 3]);
+         __syncthreads();
+         // kh 0 warps: the scores of their 16 heads x 16 keys (c0, c1: head 16 qm + g, keys 16 np + 8 j + 2t, + 1;
+         // c2, c3: head + 8)
+         const int h0 = qm * 16 + g, h1 = h0 + 8;
+         float sc[2][4], ksv[2][2];
+         bool okv[2][2];
+-        if (kh == 0) {
++        if (kh == 0 && active_qk) {
+ #pragma unroll
+             for (int q = 0; q < 16; q += 4) {
+                 const float4 o4 = *reinterpret_cast<const float4*>(X + q);
+@@ -361,7 +372,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) msa_kernel(
+             }
+         }
+         __syncthreads();
+-        if (threadIdx.x < 32) {
++        if (threadIdx.x < ACTIVE_QH) {
+             const int h = threadIdx.x;
+             const float tm = fmaxf(red[h * 4], red[h * 4 + 1]);
+             const float m = mst[h];
+@@ -372,7 +383,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) msa_kernel(
+         }
+         __syncthreads();
+         // probabilities: P^T (times the key's scale, bf16) for the PV product; the sums a head
+-        if (kh == 0) {
++        if (kh == 0 && active_qk) {
+             const float m0 = mst[h0], m1 = mst[h1];
+             float q0 = 0.f, q1 = 0.f;
+ #pragma unroll
+@@ -400,7 +411,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) msa_kernel(
+             }
+         }
+         __syncthreads();
+-        if (threadIdx.x < 32) {
++        if (threadIdx.x < ACTIVE_QH) {
+             const int h = threadIdx.x;
+             lst[h] = lst[h] * ast[h] + (red[h * 4] + red[h * 4 + 1]);
+         }
+diff --git a/src/tensorfold/families/glm5_next/cuda/msa.py b/src/tensorfold/families/glm5_next/cuda/msa.py
+index 5ce701f2..bec18c38 100644
+--- a/src/tensorfold/families/glm5_next/cuda/msa.py
++++ b/src/tensorfold/families/glm5_next/cuda/msa.py
+@@ -29,7 +29,10 @@ def _ext():
+     here = Path(__file__).parent
+     half_heads = __import__("os").environ.get("TF_GLM_MSA_HALF_HEADS", "0") == "1"
+     flags = ["-DMSA_HALF_HEADS"] if half_heads else []
+-    ext = load(name="tensorfold_glm_msa_headtiles" + ("_half" if half_heads else "_reference"), sources=[str(here / "msa.cpp"), str(here / "msa.cu")],
++    skip_qk = __import__("os").environ.get("TF_GLM_MSA_SKIP_EMPTY_QK", "0") == "1"
++    if skip_qk:
++        flags.append("-DMSA_SKIP_EMPTY_QK")
++    ext = load(name="tensorfold_glm_msa_headtiles" + ("_half" if half_heads else "_reference") + ("_qk" if skip_qk else ""), sources=[str(here / "msa.cpp"), str(here / "msa.cu")],
+                extra_cuda_cflags=["-O3", "-lineinfo"] + flags, verbose=False)
+     ext.set_fp4_lut(FP4_LUT)
+     return ext

@@ -1,0 +1,17 @@
+diff --git a/tests/test_serving_contract.py b/tests/test_serving_contract.py
+index e039f9f..567bcad 100644
+--- a/tests/test_serving_contract.py
++++ b/tests/test_serving_contract.py
+@@ -33,10 +33,10 @@ def decoded(text, stream):
+         data = json.loads(text)
+         choice = data["choices"][0]
+         return choice["message"], choice["finish_reason"]
+-    chunks = events(text)
++    chunks = [c for c in events(text) if c.get("choices")]
+     assert chunks[0]["choices"][0]["delta"] == {"role": "assistant"}
+     assert text.rstrip().endswith("data: [DONE]")
+-    deltas = [c["choices"][0]["delta"] for c in chunks]
++    deltas = [c["choices"][0]["delta"] for c in chunks if c.get("choices")]
+     message = {k: "".join(d.get(k, "") for d in deltas) for k in ("content", "reasoning_content")}
+     return message, chunks[-1]["choices"][0]["finish_reason"]
+ 

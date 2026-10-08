@@ -1,0 +1,114 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/cp_graphs.py b/src/tensorfold/families/glm5_next/cuda/cp_graphs.py
+index 248f33b2..3dcb029a 100644
+--- a/src/tensorfold/families/glm5_next/cuda/cp_graphs.py
++++ b/src/tensorfold/families/glm5_next/cuda/cp_graphs.py
+@@ -9,7 +9,24 @@ from collections import OrderedDict
+ 
+ import torch
+ 
+-from .verify import FullBatchedVerify, Verified
++from .verify import FullBatchedVerify, Segment, Verified
++
++
++def padded_segments(segments, maximum, dense_limit):
++    """Bound row-shape variety without crossing a cache or attention boundary.
++
++    Extra causal rows are never returned or committed. Copy windows larger than
++    a stream's equal share retain their original shapes.
++    """
++    if len(segments) == 1:
++        return segments  # sixteen solo row counts already fit the bounded cache
++    share = maximum // len(segments)
++    if all(len(s.tokens) == 1 for s in segments) or any(len(s.tokens) > share for s in segments):
++        return segments
++    if any(s.st.pos + share > s.st.capacity or
++           s.st.pos < dense_limit < s.st.pos + share for s in segments):
++        return segments
++    return [Segment(s.st, s.tokens + [s.tokens[-1]] * (share - len(s.tokens))) for s in segments]
+ 
+ 
+ class CPGraphVerify(FullBatchedVerify):
+@@ -24,6 +41,7 @@ class CPGraphVerify(FullBatchedVerify):
+             raise ValueError('the CP graph cache must retain at least one graph')
+         self.replays = dict(graph=0, eager=0, captures=0, evictions=0)
+         self.graph_buckets = None
++        self.pad_rows = os.environ.get('TF_GLM_CP_GRAPH_PAD', '0') == '1'
+         from .paged_cp import PagedArena
+         self.dynamic_extents = isinstance(e.caches.arena, PagedArena)
+         self.metadata = torch.zeros((rows, 3), dtype=torch.int32, device=self.b.x.device)
+@@ -41,6 +59,9 @@ class CPGraphVerify(FullBatchedVerify):
+         from .forward import compute
+ 
+         self._check(segments)
++        original = segments
++        if self.pad_rows:
++            segments = padded_segments(segments, self.rows_max, self.w.cfg.dense_limit)
+         # A window crossing the dense/sparse boundary retains the exact host path.
+         if any(s.st.pos < self.w.cfg.dense_limit < s.st.pos + len(s.tokens) for s in segments):
+             self.graph_buckets = None
+@@ -86,9 +107,10 @@ class CPGraphVerify(FullBatchedVerify):
+         graph.replay()
+         self.replays['graph'] += 1
+         out, taps, at = [], [], 0
+-        for seg in segments:
+-            n = len(seg.tokens)
++        for seg, given in zip(segments, original):
++            n = len(given.tokens)
+             out.append(logits[at:at+n])
+             taps.append(torch.cat([t[at:at+n] for t in self.b.taps], dim=1) if self.taps else None)
+-            at += n
++            at += len(seg.tokens)
++        self.segments = list(original)
+         return Verified(out, taps)
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index d7e0c30c..5d289992 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -983,7 +983,8 @@ class GlmEngine:
+         mine.append(self.cp_pool_tokens)
+         mine.append(int(os.environ.get("TF_GLM_CP_PAGED", "0")))
+         mine.extend([int(os.environ.get("TF_GLM_CP_MULTI_GRAPHS", "0")),
+-                     int(os.environ.get("TF_GLM_CP_MULTI_GRAPH_CACHE", "32"))])
++                     int(os.environ.get("TF_GLM_CP_MULTI_GRAPH_CACHE", "32")),
++                     int(os.environ.get("TF_GLM_CP_GRAPH_PAD", "0"))])
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = 0 if self.cp_pool_tokens else int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+diff --git a/tests/test_cp_graph_shapes.py b/tests/test_cp_graph_shapes.py
+new file mode 100644
+index 00000000..58b46eb4
+--- /dev/null
++++ b/tests/test_cp_graph_shapes.py
+@@ -0,0 +1,32 @@
++from types import SimpleNamespace
++
++from tensorfold.families.glm5_next.cuda.cp_graphs import padded_segments
++from tensorfold.families.glm5_next.cuda.verify import Segment
++
++
++def segment(rows, pos=100, capacity=8192):
++    return Segment(SimpleNamespace(pos=pos, capacity=capacity), list(range(rows)))
++
++
++def test_equal_share_retains_real_tokens_and_ownership():
++    original = [segment(2), segment(7)]
++    padded = padded_segments(original, 16, 2048)
++    assert [len(s.tokens) for s in padded] == [8, 8]
++    for given, actual in zip(original, padded):
++        assert actual.st is given.st
++        assert actual.tokens[:len(given.tokens)] == given.tokens
++    assert [len(s.tokens) for s in original] == [2, 7]
++
++
++def test_boundaries_and_large_copy_windows_keep_original_shapes():
++    for original in ([segment(1), segment(1)], [segment(12), segment(2)],
++                     [segment(2, pos=2045), segment(2)],
++                     [segment(2, pos=8190), segment(2)]):
++        assert padded_segments(original, 16, 2048) is original
++
++
++def test_five_streams_fit_total_row_budget_without_padding_solo():
++    assert [len(s.tokens) for s in padded_segments([segment(2) for _ in range(5)], 16, 2048)] == [3]*5
++    for rows in range(1,17):
++        solo = [segment(rows)]
++        assert padded_segments(solo, 16, 2048) is solo

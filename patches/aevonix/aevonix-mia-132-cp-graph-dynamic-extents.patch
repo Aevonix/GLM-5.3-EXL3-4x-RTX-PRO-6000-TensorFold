@@ -1,0 +1,177 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/cp_graphs.py b/src/tensorfold/families/glm5_next/cuda/cp_graphs.py
+index 8baa75f4..248f33b2 100644
+--- a/src/tensorfold/families/glm5_next/cuda/cp_graphs.py
++++ b/src/tensorfold/families/glm5_next/cuda/cp_graphs.py
+@@ -1,7 +1,7 @@
+ """Bounded lazy CUDA graphs for exact concurrent CP verification windows.
+ 
+-Graph keys include every baked-in extent/slot, row count and selection bucket.
+-Positions and physical page mappings remain mutable device inputs. Captures share
++Paged graph keys include row counts and selection buckets; extent addresses,
++capacities, positions and physical page mappings are mutable device inputs. Captures share
+ one pool and execute sequentially, as do the existing single-request graphs.
+ """
+ import os
+@@ -24,6 +24,10 @@ class CPGraphVerify(FullBatchedVerify):
+             raise ValueError('the CP graph cache must retain at least one graph')
+         self.replays = dict(graph=0, eager=0, captures=0, evictions=0)
+         self.graph_buckets = None
++        from .paged_cp import PagedArena
++        self.dynamic_extents = isinstance(e.caches.arena, PagedArena)
++        self.metadata = torch.zeros((rows, 3), dtype=torch.int32, device=self.b.x.device)
++        self.metadata_host = torch.zeros((rows, 3), dtype=torch.int32, pin_memory=True)
+         self.b.cp_graph_positions = True
+         self.b.paged_capacity = (e.caches.rows + self.cp - 1) // self.cp + 1
+         # All extents share this score allocation; later growth cannot invalidate
+@@ -44,8 +48,15 @@ class CPGraphVerify(FullBatchedVerify):
+             return super().forward(segments)
+         buckets = tuple(None if s.st.pos + len(s.tokens) <= self.w.cfg.dense_limit else
+                         bucket(s.st.pos, len(s.tokens), s.st.capacity) for s in segments)
+-        key = tuple((s.st.graph_key, s.st.capacity, len(s.tokens), b) for s, b in zip(segments, buckets))
++        key = tuple((len(s.tokens), b) if self.dynamic_extents else
++                    (s.st.graph_key, s.st.capacity, len(s.tokens), b) for s, b in zip(segments, buckets))
+         self._stage([t for s in segments for t in s.tokens])
++        if self.dynamic_extents:
++            for k, seg in enumerate(segments):
++                st = seg.st
++                self.metadata_host[k].numpy()[:] = (st.base // self.cp, st.capacity // self.cp + 1, st.pos)
++            self.metadata.copy_(self.metadata_host, non_blocking=True)
++            self.b.staged.record()
+         self.segments = list(segments)
+         self.R = sum(len(s.tokens) for s in segments)
+         self.graph_buckets = buckets
+diff --git a/src/tensorfold/families/glm5_next/cuda/paged_copy.py b/src/tensorfold/families/glm5_next/cuda/paged_copy.py
+index d2b6e732..48698cfc 100644
+--- a/src/tensorfold/families/glm5_next/cuda/paged_copy.py
++++ b/src/tensorfold/families/glm5_next/cuda/paged_copy.py
+@@ -39,22 +39,27 @@ def copy(view, count, start, value=None, *, write=False):
+ 
+ 
+ @tr.jit
+-def _position_copy(SRC, DST, TABLE, POS, BASE,
++def _position_copy(SRC, DST, TABLE, POS, BASE, DESC,
+                    CAP: tl.constexpr, WIDTH: tl.constexpr, PAGE_ROWS: tl.constexpr,
+                    ROWS: tl.constexpr, CP: tl.constexpr, RANK: tl.constexpr,
+-                   WRITE: tl.constexpr, BLOCK: tl.constexpr):
++                   WRITE: tl.constexpr, DYNAMIC: tl.constexpr, BLOCK: tl.constexpr):
+     x = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+     pos = tl.load(POS)
++    if DYNAMIC:
++        base = tl.load(DESC)
++        cap = tl.load(DESC + 1)
++    else:
++        base, cap = BASE, CAP
+     row = x // WIDTH
+     if WRITE:
+         first = tl.maximum(0, (pos + CP - 1 - RANK) // CP)
+         last = tl.maximum(0, (pos + ROWS + CP - 1 - RANK) // CP)
+         row += first
+-        valid = (row < last) & (row < CAP)
++        valid = (row < last) & (row < cap)
+     else:
+-        last = tl.minimum(CAP, (pos + ROWS + CP - 1) // CP + 1)
++        last = tl.minimum(cap, (pos + ROWS + CP - 1) // CP + 1)
+         valid = row < last
+-    local = BASE + row
++    local = base + row
+     physical = tl.load(TABLE + local // PAGE_ROWS, valid, other=0) * PAGE_ROWS + local % PAGE_ROWS
+     mapped = physical * WIDTH + x % WIDTH
+     flat = row * WIDTH + x % WIDTH
+@@ -64,14 +69,16 @@ def _position_copy(SRC, DST, TABLE, POS, BASE,
+     tl.store(DST + target, value, valid)
+ 
+ 
+-def position_copy(view, value, pos_dev, rows, cp, rank, bound, *, write=False):
++def position_copy(view, value, pos_dev, rows, cp, rank, bound, *, write=False, descriptor=None):
+     """Replay-safe raw copies: positions and page mappings remain device inputs."""
+     plane = view.arena.planes[view.plane]
+     if plane.div != cp or not value.is_contiguous() or not view.tensor.is_contiguous():
+         raise ValueError('position copies require contiguous CP planes')
+     width = view.tensor[0].numel() * view.tensor.element_size()
+-    count = tr.cdiv(rows, cp) + 1 if write else min(view.shape[0], tr.cdiv(bound, cp) + 1)
++    capacity = view.shape[0] if descriptor is None else value.shape[0]
++    count = tr.cdiv(rows, cp) + 1 if write else min(capacity, tr.cdiv(bound, cp) + 1)
+     source, target = (value, view.tensor) if write else (view.tensor, value)
+     _position_copy[(tr.cdiv(count * width, 1024),)](
+         source.view(torch.uint8), target.view(torch.uint8), view.arena.table, pos_dev,
+-        view.base // cp, view.shape[0], width, 2048 // cp, rows, cp, rank, write, 1024)
++        view.base // cp if descriptor is None else 0, descriptor,
++        capacity, width, 2048 // cp, rows, cp, rank, write, descriptor is not None, 1024)
+diff --git a/src/tensorfold/families/glm5_next/cuda/paged_cp.py b/src/tensorfold/families/glm5_next/cuda/paged_cp.py
+index dbf1f151..0108a51b 100644
+--- a/src/tensorfold/families/glm5_next/cuda/paged_cp.py
++++ b/src/tensorfold/families/glm5_next/cuda/paged_cp.py
+@@ -123,6 +123,7 @@ def run(fn, layer, w, lc, kr, pos_dev, b, R, keys, host_pos, sparse_np, **kwargs
+     if graph and not getattr(b, 'cp_graph_positions', False):
+         raise ValueError('paged CP device positions require the concurrent graph wrapper')
+     G,rank=int(w.meta['cp']),int(w.rank)
++    descriptor = getattr(b, 'cp_graph_descriptor', None) if graph else None
+     # All ranks stage identical shapes, including ranks with one fewer valid row.
+     bound = (int(sparse_np) if sparse_np is not None else int(w.cfg.dense_limit)) if graph else host_pos + R
+     count=min(lc.shape[0],-(-((bound if graph else host_pos+R))//G)+1)
+@@ -144,15 +145,15 @@ def run(fn, layer, w, lc, kr, pos_dev, b, R, keys, host_pos, sparse_np, **kwargs
+             held[name]=buf=torch.empty((cap,*v.shape[1:]),dtype=v.dtype,device=v.device)
+         if graph:
+             from .paged_copy import position_copy
+-            position_copy(v,buf,pos_dev,R,G,rank,bound)
++            position_copy(v,buf,pos_dev,R,G,rank,bound,descriptor=descriptor)
+         else:
+             v.gather(count,out=buf[:count])
+-        flat.append(buf[:v.shape[0]])
++        flat.append(buf if descriptor is not None else buf[:v.shape[0]])
+     result=fn(layer,w,*flat[:2],pos_dev,b,R,flat[2],host_pos,sparse_np,**kwargs)
+     if graph:
+         for view,value in zip(views,flat):
+             if view is not None:
+-                position_copy(view,value,pos_dev,R,G,rank,bound,write=True)
++                position_copy(view,value,pos_dev,R,G,rank,bound,write=True,descriptor=descriptor)
+         return result
+     lo=max(0,(host_pos+G-1-rank)//G)
+     hi=max(0,(host_pos+R+G-1-rank)//G)
+diff --git a/src/tensorfold/families/glm5_next/cuda/verify.py b/src/tensorfold/families/glm5_next/cuda/verify.py
+index 4888f43b..6d8899f7 100644
+--- a/src/tensorfold/families/glm5_next/cuda/verify.py
++++ b/src/tensorfold/families/glm5_next/cuda/verify.py
+@@ -413,7 +413,10 @@ class FullBatchedVerify:
+ 
+                     b.topk = self.topk[k]
+                     graph_buckets = getattr(self, 'graph_buckets', None)
+-                    self.topk[k] = dsa_full_cp(layer, w, st.kc[di], st.kr[di], st.pos_dev, b, n,
++                    dynamic = graph_buckets is not None and getattr(self, 'dynamic_extents', False)
++                    b.cp_graph_descriptor = self.metadata[k, :2] if dynamic else None
++                    pos_dev = self.metadata[k, 2:3] if dynamic else st.pos_dev
++                    self.topk[k] = dsa_full_cp(layer, w, st.kc[di], st.kr[di], pos_dev, b, n,
+                                                keys, st.pos if graph_buckets is None else None,
+                                                None if graph_buckets is None else graph_buckets[k],
+                                                lo=at, rows_only=True)
+diff --git a/tests/test_cp_graph_copy.py b/tests/test_cp_graph_copy.py
+index b01f51be..7250f013 100644
+--- a/tests/test_cp_graph_copy.py
++++ b/tests/test_cp_graph_copy.py
+@@ -25,3 +25,26 @@ def test_dynamic_positions_page_edges_and_mapping_change(width,rank):
+     view=arena.view(0,0,4096);pos.fill_(2051)
+     position_copy(view,staged,pos,9,4,rank,4096)
+     assert torch.equal(staged[:516],view.gather(516))
++
++@pytest.mark.parametrize('width', [64,132,304,528])
++@pytest.mark.parametrize('rank', range(4))
++def test_descriptor_changes_extent_without_changing_captured_view(width,rank):
++    data=(torch.arange(4097*width).reshape(4097,width)%113).to(torch.uint8)
++    arena=PagedArena(16384,[Plane(data,4,1)])
++    captured=arena.view(0,0,2048)
++    staged=torch.empty_like(data)
++    descriptor=torch.zeros(2,dtype=torch.int32)
++    pos=torch.zeros(1,dtype=torch.int32)
++    for base,size,n in [(0,2048,2039),(4096,8192,8190),(2048,4096,4079),(0,12288,10000)]:
++        actual=arena.view(0,base,size)
++        descriptor[:] = torch.tensor([base//4,actual.shape[0]])
++        pos.fill_(n)
++        position_copy(captured,staged,pos,9,4,rank,16384,descriptor=descriptor)
++        count=min(actual.shape[0],(n+12)//4+1)
++        assert torch.equal(staged[:count],actual.gather(count))
++        original=data.clone(); staged.fill_(37)
++        position_copy(captured,staged,pos,9,4,rank,16384,write=True,descriptor=descriptor)
++        lo=max(0,(n+3-rank)//4); hi=min(actual.shape[0],max(0,(n+12-rank)//4))
++        expected=original.clone()
++        expected.index_copy_(0,actual.indices(lo,hi-lo),staged[lo:hi])
++        assert torch.equal(data,expected)

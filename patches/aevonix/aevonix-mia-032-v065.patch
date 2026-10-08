@@ -1,0 +1,15 @@
+diff --git a/src/tensorfold/cuda/geometry.py b/src/tensorfold/cuda/geometry.py
+index b01346af..16c81025 100644
+--- a/src/tensorfold/cuda/geometry.py
++++ b/src/tensorfold/cuda/geometry.py
+@@ -609,6 +609,10 @@ def dflash2_weights(draft_dir, world: int, fraction=None, *, bf16: bool = False)
+     resident = sum(2 * n * k if bf16 else q4(n, k) for n, k in mats)
+     for name, dims in shape.items():
+         if name not in quantized:
++            # Full GLM's native-BF16 drafter keeps selector codebooks as host
++            # NumPy arrays. They must not reduce the GPU's admissible KV window.
++            if bf16 and name.endswith("_codebook"):
++                continue
+             resident += math.prod(dims) * (4 if name.endswith("_codebook") else 2)
+     staging = max(2 * n * k if bf16 else 4 * n * k + 24 * min(n, 8192) * k for n, k in mats)
+     return Weights(resident, staging, 0)

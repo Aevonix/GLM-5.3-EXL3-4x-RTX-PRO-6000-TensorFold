@@ -1,0 +1,124 @@
+From 708e3a95e6e2245fc96ae368242ee46e796d6035 Mon Sep 17 00:00:00 2001
+From: Aevonix <contact@aevonix.com>
+Date: Mon, 5 Oct 2026 20:52:02 -0400
+Subject: [PATCH] Bound concurrent CP verification shapes and retain 128 graphs
+
+---
+ .../families/glm5_next/cuda/cp_graphs.py      | 17 ++++++++++----
+ .../families/glm5_next/cuda/engine.py         |  2 +-
+ .../families/glm5_next/cuda/memory_receipt.py |  2 ++
+ tests/test_cp_graph_shapes.py                 | 22 +++++++++++++++++++
+ 4 files changed, 38 insertions(+), 5 deletions(-)
+
+diff --git a/src/tensorfold/families/glm5_next/cuda/cp_graphs.py b/src/tensorfold/families/glm5_next/cuda/cp_graphs.py
+index 3dcb029a..46be977e 100644
+--- a/src/tensorfold/families/glm5_next/cuda/cp_graphs.py
++++ b/src/tensorfold/families/glm5_next/cuda/cp_graphs.py
+@@ -12,7 +12,7 @@ import torch
+ from .verify import FullBatchedVerify, Segment, Verified
+ 
+ 
+-def padded_segments(segments, maximum, dense_limit):
++def padded_segments(segments, maximum, dense_limit, *, buckets=False):
+     """Bound row-shape variety without crossing a cache or attention boundary.
+ 
+     Extra causal rows are never returned or committed. Copy windows larger than
+@@ -21,6 +21,12 @@ def padded_segments(segments, maximum, dense_limit):
+     if len(segments) == 1:
+         return segments  # sixteen solo row counts already fit the bounded cache
+     share = maximum // len(segments)
++    if buckets:
++        # Use the smallest common bucket that holds every stream. Keeping the
++        # final equal-share bucket admits five streams in the sixteen-row tile.
++        sizes = sorted({1, share, *(n for n in (2, 4, 8, 16) if n <= share)})
++        needed = max(len(s.tokens) for s in segments)
++        share = next((n for n in sizes if n >= needed), share)
+     if all(len(s.tokens) == 1 for s in segments) or any(len(s.tokens) > share for s in segments):
+         return segments
+     if any(s.st.pos + share > s.st.capacity or
+@@ -36,12 +42,14 @@ class CPGraphVerify(FullBatchedVerify):
+             raise ValueError('CP graphs require context parallelism')
+         self.pool = pool or torch.cuda.graph_pool_handle()
+         self.graphs = OrderedDict()
+-        self.maximum = int(os.environ.get('TF_GLM_CP_MULTI_GRAPH_CACHE', '32'))
++        self.maximum = int(os.environ.get('TF_GLM_CP_MULTI_GRAPH_CACHE', '128'))
+         if self.maximum < 1:
+             raise ValueError('the CP graph cache must retain at least one graph')
+         self.replays = dict(graph=0, eager=0, captures=0, evictions=0)
+         self.graph_buckets = None
+-        self.pad_rows = os.environ.get('TF_GLM_CP_GRAPH_PAD', '0') == '1'
++        self.pad_rows = int(os.environ.get('TF_GLM_CP_GRAPH_PAD', '0'))
++        if self.pad_rows not in (0, 1, 2):
++            raise ValueError('TF_GLM_CP_GRAPH_PAD: 0 (off), 1 (equal share), 2 (row buckets)')
+         from .paged_cp import PagedArena
+         self.dynamic_extents = isinstance(e.caches.arena, PagedArena)
+         self.metadata = torch.zeros((rows, 3), dtype=torch.int32, device=self.b.x.device)
+@@ -61,7 +69,8 @@ class CPGraphVerify(FullBatchedVerify):
+         self._check(segments)
+         original = segments
+         if self.pad_rows:
+-            segments = padded_segments(segments, self.rows_max, self.w.cfg.dense_limit)
++            segments = padded_segments(segments, self.rows_max, self.w.cfg.dense_limit,
++                                       buckets=self.pad_rows == 2)
+         # A window crossing the dense/sparse boundary retains the exact host path.
+         if any(s.st.pos < self.w.cfg.dense_limit < s.st.pos + len(s.tokens) for s in segments):
+             self.graph_buckets = None
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 95496cd7..8d1a2485 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -995,7 +995,7 @@ class GlmEngine:
+         mine.append(self.cp_pool_tokens)
+         mine.append(int(os.environ.get("TF_GLM_CP_PAGED", "0")))
+         mine.extend([int(os.environ.get("TF_GLM_CP_MULTI_GRAPHS", "0")),
+-                     int(os.environ.get("TF_GLM_CP_MULTI_GRAPH_CACHE", "32")),
++                     int(os.environ.get("TF_GLM_CP_MULTI_GRAPH_CACHE", "128")),
+                      int(os.environ.get("TF_GLM_CP_GRAPH_PAD", "0"))])
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+diff --git a/src/tensorfold/families/glm5_next/cuda/memory_receipt.py b/src/tensorfold/families/glm5_next/cuda/memory_receipt.py
+index 387846d6..7cb30796 100644
+--- a/src/tensorfold/families/glm5_next/cuda/memory_receipt.py
++++ b/src/tensorfold/families/glm5_next/cuda/memory_receipt.py
+@@ -110,6 +110,8 @@ def receipt(engine, stage):
+     result = dict(signal_dump_available=_installed and signal.getsignal(MEMORY_SIGNAL) is _request,
+                   concurrent_verify_replays=dict(getattr(verify, 'replays', {})),
+                   concurrent_verify_graphs=len(getattr(verify, 'graphs', {})),
++                  concurrent_verify_graph_limit=getattr(verify, 'maximum', None),
++                  concurrent_verify_padding=getattr(verify, 'pad_rows', None),
+                   concurrent_draft_graphs=dict(getattr(multi, 'graph_counts', {})),
+                   signal_dump_number=int(MEMORY_SIGNAL), signal_dump_name=MEMORY_SIGNAL.name,
+                   pid=os.getpid(), parallel=engine.parallel,
+diff --git a/tests/test_cp_graph_shapes.py b/tests/test_cp_graph_shapes.py
+index 58b46eb4..4374cac7 100644
+--- a/tests/test_cp_graph_shapes.py
++++ b/tests/test_cp_graph_shapes.py
+@@ -30,3 +30,25 @@ def test_five_streams_fit_total_row_budget_without_padding_solo():
+     for rows in range(1,17):
+         solo = [segment(rows)]
+         assert padded_segments(solo, 16, 2048) is solo
++
++
++def test_bucket_padding_bounds_and_causal_prefixes():
++    from itertools import product
++
++    for streams in range(2, 6):
++        for counts in product(range(1, 17 // streams + 1), repeat=streams):
++            original = [segment(n) for n in counts]
++            padded = padded_segments(original, 16, 2048, buckets=True)
++            assert sum(len(s.tokens) for s in padded) <= 16
++            for given, actual in zip(original, padded):
++                assert actual.st is given.st
++                assert actual.tokens[:len(given.tokens)] == given.tokens
++            if max(counts) <= 2:
++                assert max(len(s.tokens) for s in padded) <= 2
++
++
++def test_bucket_padding_checks_actual_bucket_boundary():
++    original = [segment(2, pos=2046), segment(2)]
++    assert [len(s.tokens) for s in padded_segments(original, 16, 2048, buckets=True)] == [2, 2]
++    original = [segment(3, pos=2045), segment(2)]
++    assert padded_segments(original, 16, 2048, buckets=True) is original
+-- 
+2.43.0
+

@@ -1,0 +1,256 @@
+From da25bf57e8bd1e818362db809b89b2c4bba553a7 Mon Sep 17 00:00:00 2001
+From: Aevonix <contact@aevonix.com>
+Date: Mon, 5 Oct 2026 20:58:41 -0400
+Subject: [PATCH] Choose bounded verification depth and causal DSpark blocks by
+ batch
+
+---
+ .../families/glm5_next/cuda/batch_draft.py    | 32 +++++++++
+ .../families/glm5_next/cuda/dspark_multi.py   | 38 ++++++++--
+ .../families/glm5_next/cuda/engine.py         |  3 +
+ .../families/glm5_next/cuda/multi.py          |  9 ++-
+ tests/test_cp_batch_draft.py                  | 69 +++++++++++++++++++
+ 5 files changed, 145 insertions(+), 6 deletions(-)
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/batch_draft.py
+ create mode 100644 tests/test_cp_batch_draft.py
+
+diff --git a/src/tensorfold/families/glm5_next/cuda/batch_draft.py b/src/tensorfold/families/glm5_next/cuda/batch_draft.py
+new file mode 100644
+index 00000000..23cb69ec
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/batch_draft.py
+@@ -0,0 +1,32 @@
++"""Explicit batch-size policy for full-model speculative verification.
++
++Five entries address one through five active streams. Tables are deployment
++settings to measure, not a single-stream cost model extrapolated to a batch.
++"""
++import os
++
++
++def settings():
++    def table(name, default, minimum, maximum):
++        raw = os.environ.get(name, '').strip()
++        values = tuple(map(int, raw.split(','))) if raw else default
++        if len(values) != 5 or any(not lo <= x <= maximum for x, lo in zip(values, minimum)):
++            raise ValueError(f'{name}: five per-batch entries within the verification row budget')
++        return values
++    rows = table('TF_GLM_BATCH_VERIFY_ROWS', (16,)*5, range(1,6), 16)
++    depths = table('TF_GLM_BATCH_DRAFT_DEPTH', (8,)*5, (0,)*5, 8)
++    blocks = os.environ.get('TF_GLM_DSPARK_BATCH_BLOCKS', '0')
++    if blocks not in ('0', '1'):
++        raise ValueError('TF_GLM_DSPARK_BATCH_BLOCKS: 0 or 1')
++    return rows, depths, int(blocks)
++
++
++def limits(streams, rows, depths):
++    if not 1 <= streams <= 5:
++        raise ValueError('full-model batch needs one through five streams')
++    width = rows[streams-1]
++    return width, min(depths[streams-1], width//streams-1)
++
++
++def block_sizes(maximum):
++    return tuple(sorted({maximum, *(x for x in (1,2,4,8) if x <= maximum)}))
+diff --git a/src/tensorfold/families/glm5_next/cuda/dspark_multi.py b/src/tensorfold/families/glm5_next/cuda/dspark_multi.py
+index dc3ec4f0..b4a09378 100644
+--- a/src/tensorfold/families/glm5_next/cuda/dspark_multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/dspark_multi.py
+@@ -74,12 +74,34 @@ class DSparkMulti:
+         self.streams = streams
+         self.block = drafter.block              # drafts a pass gives (not block - 1: the anchor predicts the first)
+         self.contexts = [context(drafter) for _ in range(streams)]
++        from .batch_draft import settings, block_sizes
++        self.batch_blocks = bool(settings()[2])
++        if self.batch_blocks and not drafter.causal:
++            raise ValueError('batch-sized DSpark blocks require causal block attention')
++        self.variants = []
+         for i, c in enumerate(self.contexts):
+             c.owner, c.slot = self, i
++            variants = {c.block: c}
++            if self.batch_blocks:
++                for size in block_sizes(c.block):
++                    if size == c.block:
++                        continue
++                    v = copy.copy(c)
++                    v.block = size
++                    v.ids = c.ids[:size]  # one pending token; every other slot remains a mask
++                    v.cand_n = v.gathered * size * 2 * v.top_k
++                    v.cand = torch.zeros(v.cand_n+size, dtype=c.cand.dtype, device=c.cand.device)
++                    v.cand_host = torch.zeros(v.cand.shape, dtype=c.cand.dtype, pin_memory=torch.cuda.is_available())
++                    v.packed = v.cand[:v.cand_n].view(v.gathered, size, 2*v.top_k)
++                    v.hconf = v.cand[v.cand_n:]
++                    variants[size] = v
++            self.variants.append(variants)
+ 
+     def nbytes(self) -> int:
+         """The contexts' buffers (the weights are the drafter's)."""
+-        return sum(context_bytes(c) for c in self.contexts)
++        return sum(context_bytes(c) for c in self.contexts) + sum(
++            v.cand.numel()*v.cand.element_size() for c, variants in zip(self.contexts, self.variants)
++            for v in variants.values() if v is not c)
+ 
+     def reset(self) -> None:
+         for c in self.contexts:
+@@ -107,9 +129,12 @@ class DSparkMulti:
+             for rows in range(1, c.tap_rows + 1):
+                 c.tap_graphs[rows] = capturer(lambda c=c, rows=rows: c._taps_compute(rows), pool)
+                 c.reset()
+-            c.block_graph = capturer(c._block_compute, pool)
++            for v in self.variants[c.slot].values():
++                v.pool = pool
++                v.block_graph = capturer(v._block_compute, pool)
++            c.block_graph = self.variants[c.slot][c.block].block_graph
+             c.reset()
+-            n += len(c.tap_graphs) + 1
++            n += len(c.tap_graphs) + len(self.variants[c.slot])
+         if torch.cuda.is_available():
+             torch.cuda.synchronize()
+         return n
+@@ -118,6 +143,8 @@ class DSparkMulti:
+         for c in self.contexts:
+             c.block_graph = None
+             c.tap_graphs = {}
++            for v in self.variants[c.slot].values():
++                v.block_graph = None
+ 
+     def _own(self, ctx) -> None:
+         if getattr(ctx, "owner", None) is not self:
+@@ -139,7 +166,10 @@ class DSparkMulti:
+             if depth < 1 or r.ctx.context_end == 0:
+                 out.append([])
+                 continue
+-            out.append(list(r.ctx.propose(r.pending, depth, r.sampling, r.confidence, beta=r.beta,
++            variants = self.variants[r.ctx.slot]
++            ctx = variants[min(size for size in variants if size >= depth)]
++            ctx.context_end = r.ctx.context_end
++            out.append(list(ctx.propose(r.pending, depth, r.sampling, r.confidence, beta=r.beta,
+                                           round_ms=r.round_ms)))
+         return out
+ 
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 0da438e2..68fc4867 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -994,6 +994,9 @@ class GlmEngine:
+         mine.append(disk_on)
+         mine.append(int(os.environ.get("TF_GLM_CP_NATIVE_PAGED", "0")))
+         mine.append(int(os.environ.get("TF_GLM_CP_BATCH_EXCHANGE", "0")))
++        from .batch_draft import settings as batch_draft_settings
++        batch_rows, batch_depths, batch_blocks = batch_draft_settings()
++        mine.extend([*batch_rows, *batch_depths, batch_blocks])
+         mine.append(self.cp_pool_tokens)
+         mine.append(int(os.environ.get("TF_GLM_CP_PAGED", "0")))
+         mine.extend([int(os.environ.get("TF_GLM_CP_MULTI_GRAPHS", "0")),
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi.py b/src/tensorfold/families/glm5_next/cuda/multi.py
+index 7568da0d..d2b6b8de 100644
+--- a/src/tensorfold/families/glm5_next/cuda/multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/multi.py
+@@ -463,6 +463,8 @@ class MultiDecoder:
+         # (``full_seg.FullSegVerify``, CUDA graphs a window shape; at most FULL_MAX_ROWS rows a round, every stream's)
+         self.full = bool(self.w.cfg.full)
+         self.window_rows = FULL_MAX_ROWS if self.full else MAX_WINDOW
++        from .batch_draft import settings
++        self.batch_rows, self.batch_depths, _ = settings()
+         if self.full and int(self.w.meta.get("cp", 1)) > 1 and self.group:
+             raise ValueError("concurrent CP uses independent prompt chunks: TF_GLM_MULTI_PREFILL=0")
+         self.drafts = drafts
+@@ -1552,7 +1554,10 @@ class MultiDecoder:
+         asks = []
+         # full GLM-5.3: every stream's window in one batched verify of at most FULL_MAX_ROWS rows, so each stream drafts
+         # at most its share (2 streams: 7, 3: 4, 4: 3); ``trim`` still cuts copied drafts to the round's rows
+-        share = max(0, self.window_rows // max(1, len(lanes)) - 1) if self.full else None
++        window_rows, share = self.window_rows, None
++        if self.full:
++            from .batch_draft import limits
++            window_rows, share = limits(len(lanes), self.batch_rows, self.batch_depths)
+         for l in lanes:
+             c = l.copies.propose(copy_room(l.copies, l.s.count, l.s.out)) if l.copies is not None and not short else []
+             copied.append(bool(c))
+@@ -1570,7 +1575,7 @@ class MultiDecoder:
+             got = self.drafts.propose([a for _, a in asks])
+             for (k, _), d in zip(asks, got):
+                 drafts[k] = list(d)
+-        drafts = trim(drafts, self.window_rows)
++        drafts = trim(drafts, window_rows)
+         if prof is not None:
+             prof.mark("propose")
+         segments = []
+diff --git a/tests/test_cp_batch_draft.py b/tests/test_cp_batch_draft.py
+new file mode 100644
+index 00000000..48d6aeeb
+--- /dev/null
++++ b/tests/test_cp_batch_draft.py
+@@ -0,0 +1,69 @@
++import pytest
++import torch
++from tensorfold.families.glm5_next.cuda.batch_draft import settings, limits
++from tensorfold.families.glm5_next.cuda.dspark_multi import DSparkMulti
++from tensorfold.families.glm5_next.cuda.dflash2_multi import DraftRequest
++
++
++def test_batch_tables_are_bounded_and_disable_drafting(monkeypatch):
++    monkeypatch.setenv('TF_GLM_BATCH_VERIFY_ROWS', '9,12,12,12,10')
++    monkeypatch.setenv('TF_GLM_BATCH_DRAFT_DEPTH', '8,4,3,2,0')
++    rows, depths, _ = settings()
++    assert [limits(n, rows, depths) for n in range(1,6)] == [(9,8),(12,4),(12,3),(12,2),(10,0)]
++
++
++@pytest.mark.parametrize('key,value', [('TF_GLM_BATCH_VERIFY_ROWS','16,16'),
++    ('TF_GLM_BATCH_VERIFY_ROWS','16,16,16,16,4'), ('TF_GLM_BATCH_VERIFY_ROWS','17,16,16,16,16'),
++    ('TF_GLM_BATCH_DRAFT_DEPTH','8,8,8,8,-1'), ('TF_GLM_DSPARK_BATCH_BLOCKS','yes')])
++def test_invalid_batch_table_fails_before_collectives(monkeypatch,key,value):
++    monkeypatch.setenv(key,value)
++    with pytest.raises(ValueError):
++        settings()
++
++
++class FakeDrafter:
++    __module__ = 'tensorfold.families.glm5_next.cuda.dspark'
++
++    def __init__(self):
++        self.block, self.causal, self.gathered, self.top_k = 8, True, 1, 2
++        self.kc = [torch.zeros(2,32,4)]
++        self.vc = [torch.zeros(2,32,4)]
++        self.pos_dev = torch.zeros(1, dtype=torch.int64)
++        self.ids = torch.zeros(8, dtype=torch.int32)
++        self.ids_host = torch.zeros(1, dtype=torch.int32)
++        self.tap_in = torch.zeros(16,4)
++        self.tap_rows = 2
++        self.cand_n = 32
++        self.cand = torch.zeros(40)
++        self.cand_host = torch.zeros(40)
++        self.context_end = 0
++
++    def propose(self, pending, depth, sampling, confidence, **kwargs):
++        assert self.context_end == int(self.pos_dev[0])
++        return [self.block]*depth
++
++
++def test_short_blocks_share_committed_context_and_own_candidates(monkeypatch):
++    monkeypatch.setenv('TF_GLM_DSPARK_BATCH_BLOCKS','1')
++    md = DSparkMulti(FakeDrafter(), streams=2)
++    ctx = md.contexts[1]
++    ctx.context_end = 17
++    ctx.pos_dev[0] = 17
++    assert set(md.variants[1]) == {1,2,4,8}
++    for size, v in md.variants[1].items():
++        assert v.kc is ctx.kc and v.vc is ctx.vc and v.pos_dev is ctx.pos_dev
++        if size != 8:
++            assert v.cand.data_ptr() != ctx.cand.data_ptr()
++    for depth, block in [(1,1),(2,2),(3,4),(7,8)]:
++        assert md.propose([DraftRequest(ctx, 5, depth, None, 0.)]) == [[block]*depth]
++    ctx.context_end = 21
++    ctx.pos_dev[0] = 21
++    assert md.propose([DraftRequest(ctx, 5, 2, None, 0.)]) == [[2,2]]
++
++
++def test_noncausal_drafter_rejects_short_blocks(monkeypatch):
++    monkeypatch.setenv('TF_GLM_DSPARK_BATCH_BLOCKS','1')
++    d = FakeDrafter()
++    d.causal = False
++    with pytest.raises(ValueError, match='causal'):
++        DSparkMulti(d)
+-- 
+2.43.0
+

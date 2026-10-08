@@ -1,0 +1,30 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 3dfa2701..d7e0c30c 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -982,6 +982,8 @@ class GlmEngine:
+         mine.append(disk_on)
+         mine.append(self.cp_pool_tokens)
+         mine.append(int(os.environ.get("TF_GLM_CP_PAGED", "0")))
++        mine.extend([int(os.environ.get("TF_GLM_CP_MULTI_GRAPHS", "0")),
++                     int(os.environ.get("TF_GLM_CP_MULTI_GRAPH_CACHE", "32"))])
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = 0 if self.cp_pool_tokens else int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+diff --git a/src/tensorfold/families/glm5_next/cuda/memory_receipt.py b/src/tensorfold/families/glm5_next/cuda/memory_receipt.py
+index 7d216459..387846d6 100644
+--- a/src/tensorfold/families/glm5_next/cuda/memory_receipt.py
++++ b/src/tensorfold/families/glm5_next/cuda/memory_receipt.py
+@@ -105,7 +105,12 @@ def receipt(engine, stage):
+         row['reserved_bytes'] += segment['total_size']
+         row['allocated_bytes'] += segment['allocated_size']
+     stats = torch.cuda.memory_stats()
++    multi = getattr(engine, 'multi', None)
++    verify = getattr(multi, 'verify', None)
+     result = dict(signal_dump_available=_installed and signal.getsignal(MEMORY_SIGNAL) is _request,
++                  concurrent_verify_replays=dict(getattr(verify, 'replays', {})),
++                  concurrent_verify_graphs=len(getattr(verify, 'graphs', {})),
++                  concurrent_draft_graphs=dict(getattr(multi, 'graph_counts', {})),
+                   signal_dump_number=int(MEMORY_SIGNAL), signal_dump_name=MEMORY_SIGNAL.name,
+                   pid=os.getpid(), parallel=engine.parallel,
+                   pool_tokens=e.caches.arena.rows, dense=os.environ.get('TF_GLM_DENSE'),

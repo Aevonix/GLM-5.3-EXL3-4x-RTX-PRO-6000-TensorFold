@@ -1,0 +1,33 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/decode.py b/src/tensorfold/families/glm5_next/cuda/decode.py
+index c1bd2edb..8d7d3b00 100644
+--- a/src/tensorfold/families/glm5_next/cuda/decode.py
++++ b/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ import time
+ from dataclasses import dataclass, field
+ from typing import Sequence
+@@ -19,6 +20,9 @@ from .sparse import pool_bucket
+ from .weights import Weights
+ 
+ 
++GRAPH_BOUNDARY = os.environ.get("TF_GLM_GRAPH_BOUNDARY", "0") == "1"
++
++
+ class StopVote:
+     """A serial run's stop (issue #38): rank 0's ``on_tokens`` asks for it (the client has gone, a stop string, a
+     gate's cut), and every rank learns it from the next verify sample's all-gather, which carries one float32 word
+@@ -335,6 +339,10 @@ class Engine:
+     def verify_window(self, tokens: list[int]) -> list[int]:
+         """The window a reply's grammar keeps (a chain cut at its first rejected draft), masked at the next sample."""
+ 
++        if GRAPH_BOUNDARY and self.w.cfg.full and self.graphed():
++            room = self.w.cfg.dense_limit - self.st.pos
++            if 0 < room < len(tokens):
++                tokens = tokens[:room]
+         if self.constraint is None:
+             return tokens
+         self.window = self.constraint.window(tokens, list(range(-1, len(tokens) - 1)))

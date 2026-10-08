@@ -1,0 +1,263 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/cp_graphs.py b/src/tensorfold/families/glm5_next/cuda/cp_graphs.py
+new file mode 100644
+index 00000000..8baa75f4
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/cp_graphs.py
+@@ -0,0 +1,83 @@
++"""Bounded lazy CUDA graphs for exact concurrent CP verification windows.
++
++Graph keys include every baked-in extent/slot, row count and selection bucket.
++Positions and physical page mappings remain mutable device inputs. Captures share
++one pool and execute sequentially, as do the existing single-request graphs.
++"""
++import os
++from collections import OrderedDict
++
++import torch
++
++from .verify import FullBatchedVerify, Verified
++
++
++class CPGraphVerify(FullBatchedVerify):
++    def __init__(self, e, *, taps=(), rows=16, pool=None):
++        super().__init__(e, taps=taps, rows=rows)
++        if self.cp <= 1:
++            raise ValueError('CP graphs require context parallelism')
++        self.pool = pool or torch.cuda.graph_pool_handle()
++        self.graphs = OrderedDict()
++        self.maximum = int(os.environ.get('TF_GLM_CP_MULTI_GRAPH_CACHE', '32'))
++        if self.maximum < 1:
++            raise ValueError('the CP graph cache must retain at least one graph')
++        self.replays = dict(graph=0, eager=0, captures=0, evictions=0)
++        self.graph_buckets = None
++        self.b.cp_graph_positions = True
++        self.b.paged_capacity = (e.caches.rows + self.cp - 1) // self.cp + 1
++        # All extents share this score allocation; later growth cannot invalidate
++        # scratch pointers embedded in a previously captured graph.
++        from .forward import CpScratch
++        self.b.cp_scratch = CpScratch(self.w, rows, self.b.paged_capacity, self.b.x.device)
++
++    @torch.no_grad()
++    def forward(self, segments):
++        from .dsa_full import bucket
++        from .forward import compute
++
++        self._check(segments)
++        # A window crossing the dense/sparse boundary retains the exact host path.
++        if any(s.st.pos < self.w.cfg.dense_limit < s.st.pos + len(s.tokens) for s in segments):
++            self.graph_buckets = None
++            self.replays['eager'] += 1
++            return super().forward(segments)
++        buckets = tuple(None if s.st.pos + len(s.tokens) <= self.w.cfg.dense_limit else
++                        bucket(s.st.pos, len(s.tokens), s.st.capacity) for s in segments)
++        key = tuple((s.st.graph_key, s.st.capacity, len(s.tokens), b) for s, b in zip(segments, buckets))
++        self._stage([t for s in segments for t in s.tokens])
++        self.segments = list(segments)
++        self.R = sum(len(s.tokens) for s in segments)
++        self.graph_buckets = buckets
++
++        def run():
++            self.topk = [None] * len(segments)
++            return compute(self.w, None, self.b, self.R, mixer=self._mixer)
++
++        item = self.graphs.pop(key, None)
++        if item is None:
++            if len(self.graphs) >= self.maximum:
++                torch.cuda.synchronize()
++                self.graphs.popitem(last=False)
++                self.replays['evictions'] += 1
++            # Writes repeat the same uncommitted rows; no positions or scheduler
++            # state advance until the caller accepts and commits the window.
++            for _ in range(2):
++                run()
++            torch.cuda.synchronize()
++            graph = torch.cuda.CUDAGraph()
++            with torch.cuda.graph(graph, pool=self.pool):
++                logits = run()
++            item = graph, logits
++            self.replays['captures'] += 1
++        self.graphs[key] = item
++        graph, logits = item
++        graph.replay()
++        self.replays['graph'] += 1
++        out, taps, at = [], [], 0
++        for seg in segments:
++            n = len(seg.tokens)
++            out.append(logits[at:at+n])
++            taps.append(torch.cat([t[at:at+n] for t in self.b.taps], dim=1) if self.taps else None)
++            at += n
++        return Verified(out, taps)
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi.py b/src/tensorfold/families/glm5_next/cuda/multi.py
+index 138da63f..7568da0d 100644
+--- a/src/tensorfold/families/glm5_next/cuda/multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/multi.py
+@@ -470,7 +470,9 @@ class MultiDecoder:
+         # (nothing replays two at once); TF_GLM_MULTI_GRAPHS / TF_GLM_MULTI_DRAFT_GRAPHS=0: eager (the same bits)
+         self.graph_pool = None
+         self.graph_counts = {"verify": 0, "drafts": 0}
+-        full_graphs = self.full and torch.cuda.is_available() and getattr(e, "graphs", None) is not None
++        cp_graphs = (self.full and int(self.w.meta.get("cp", 1)) > 1 and
++                     os.environ.get("TF_GLM_CP_MULTI_GRAPHS", "0") == "1")
++        full_graphs = self.full and torch.cuda.is_available() and (getattr(e, "graphs", None) is not None or cp_graphs)
+         if self.drafts is None and engine.drafter is not None:
+             if type(engine.drafter).__module__.endswith(".dspark"):
+                 from .dspark_multi import DSparkMulti
+@@ -500,7 +502,11 @@ class MultiDecoder:
+                     self.graph_counts["verify"] = verify.capture(most=int(engine.limit) + FULL_MAX_ROWS,
+                                                                  pool=self._graph_pool())
+             elif kind == "segments":
+-                verify = FullBatchedVerify(e, taps=taps, rows=FULL_MAX_ROWS)
++                if cp_graphs and torch.cuda.is_available():
++                    from .cp_graphs import CPGraphVerify
++                    verify = CPGraphVerify(e, taps=taps, rows=FULL_MAX_ROWS, pool=self._graph_pool())
++                else:
++                    verify = FullBatchedVerify(e, taps=taps, rows=FULL_MAX_ROWS)
+             else:
+                 verify = SerialVerify(e, taps=self.drafts is not None)
+         if verify is None:
+diff --git a/src/tensorfold/families/glm5_next/cuda/paged_copy.py b/src/tensorfold/families/glm5_next/cuda/paged_copy.py
+index f6439095..d2b6e732 100644
+--- a/src/tensorfold/families/glm5_next/cuda/paged_copy.py
++++ b/src/tensorfold/families/glm5_next/cuda/paged_copy.py
+@@ -36,3 +36,42 @@ def copy(view, count, start, value=None, *, write=False):
+         source.view(torch.uint8), target.view(torch.uint8), view.arena.table,
+         view.base // plane.div, start, count, width, 2048 // plane.div, write, 1024)
+     return value
++
++
++@tr.jit
++def _position_copy(SRC, DST, TABLE, POS, BASE,
++                   CAP: tl.constexpr, WIDTH: tl.constexpr, PAGE_ROWS: tl.constexpr,
++                   ROWS: tl.constexpr, CP: tl.constexpr, RANK: tl.constexpr,
++                   WRITE: tl.constexpr, BLOCK: tl.constexpr):
++    x = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    pos = tl.load(POS)
++    row = x // WIDTH
++    if WRITE:
++        first = tl.maximum(0, (pos + CP - 1 - RANK) // CP)
++        last = tl.maximum(0, (pos + ROWS + CP - 1 - RANK) // CP)
++        row += first
++        valid = (row < last) & (row < CAP)
++    else:
++        last = tl.minimum(CAP, (pos + ROWS + CP - 1) // CP + 1)
++        valid = row < last
++    local = BASE + row
++    physical = tl.load(TABLE + local // PAGE_ROWS, valid, other=0) * PAGE_ROWS + local % PAGE_ROWS
++    mapped = physical * WIDTH + x % WIDTH
++    flat = row * WIDTH + x % WIDTH
++    source = flat if WRITE else mapped
++    target = mapped if WRITE else flat
++    value = tl.load(SRC + source, valid, other=0)
++    tl.store(DST + target, value, valid)
++
++
++def position_copy(view, value, pos_dev, rows, cp, rank, bound, *, write=False):
++    """Replay-safe raw copies: positions and page mappings remain device inputs."""
++    plane = view.arena.planes[view.plane]
++    if plane.div != cp or not value.is_contiguous() or not view.tensor.is_contiguous():
++        raise ValueError('position copies require contiguous CP planes')
++    width = view.tensor[0].numel() * view.tensor.element_size()
++    count = tr.cdiv(rows, cp) + 1 if write else min(view.shape[0], tr.cdiv(bound, cp) + 1)
++    source, target = (value, view.tensor) if write else (view.tensor, value)
++    _position_copy[(tr.cdiv(count * width, 1024),)](
++        source.view(torch.uint8), target.view(torch.uint8), view.arena.table, pos_dev,
++        view.base // cp, view.shape[0], width, 2048 // cp, rows, cp, rank, write, 1024)
+diff --git a/src/tensorfold/families/glm5_next/cuda/paged_cp.py b/src/tensorfold/families/glm5_next/cuda/paged_cp.py
+index aacaedf4..dbf1f151 100644
+--- a/src/tensorfold/families/glm5_next/cuda/paged_cp.py
++++ b/src/tensorfold/families/glm5_next/cuda/paged_cp.py
+@@ -119,11 +119,13 @@ class PagedArena(Arena):
+ def run(fn, layer, w, lc, kr, pos_dev, b, R, keys, host_pos, sparse_np, **kwargs):
+     if not isinstance(lc, PagedView):
+         return fn(layer,w,lc,kr,pos_dev,b,R,keys,host_pos,sparse_np,**kwargs)
+-    if host_pos is None or sparse_np is not None:
+-        raise ValueError('paged CP reference requires eager windows and a host position')
++    graph = host_pos is None
++    if graph and not getattr(b, 'cp_graph_positions', False):
++        raise ValueError('paged CP device positions require the concurrent graph wrapper')
+     G,rank=int(w.meta['cp']),int(w.rank)
+     # All ranks stage identical shapes, including ranks with one fewer valid row.
+-    count=min(lc.shape[0],-(-(host_pos+R)//G)+1)
++    bound = (int(sparse_np) if sparse_np is not None else int(w.cfg.dense_limit)) if graph else host_pos + R
++    count=min(lc.shape[0],-(-((bound if graph else host_pos+R))//G)+1)
+     held=getattr(b,'paged_buffers',None)
+     if held is None:
+         held=b.paged_buffers={}
+@@ -134,15 +136,24 @@ def run(fn, layer, w, lc, kr, pos_dev, b, R, keys, host_pos, sparse_np, **kwargs
+             flat.append(None);continue
+         # Match the admitted extent, not the growing prefix. Returning its full
+         # shape also lets the unchanged CP KV-gather scratch allocate once.
+-        cap=v.shape[0]
++        cap=max(v.shape[0], getattr(b, 'paged_capacity', 0))
+         buf=held.get(name)
+         if buf is None or buf.shape[0]<cap or buf.dtype!=v.dtype:
+             held.pop(name, None)
+             buf = None  # release the old allocation before requesting its replacement
+             held[name]=buf=torch.empty((cap,*v.shape[1:]),dtype=v.dtype,device=v.device)
+-        v.gather(count,out=buf[:count])
+-        flat.append(buf[:cap])
++        if graph:
++            from .paged_copy import position_copy
++            position_copy(v,buf,pos_dev,R,G,rank,bound)
++        else:
++            v.gather(count,out=buf[:count])
++        flat.append(buf[:v.shape[0]])
+     result=fn(layer,w,*flat[:2],pos_dev,b,R,flat[2],host_pos,sparse_np,**kwargs)
++    if graph:
++        for view,value in zip(views,flat):
++            if view is not None:
++                position_copy(view,value,pos_dev,R,G,rank,bound,write=True)
++        return result
+     lo=max(0,(host_pos+G-1-rank)//G)
+     hi=max(0,(host_pos+R+G-1-rank)//G)
+     if hi>lo:
+diff --git a/src/tensorfold/families/glm5_next/cuda/verify.py b/src/tensorfold/families/glm5_next/cuda/verify.py
+index a7d85e80..4888f43b 100644
+--- a/src/tensorfold/families/glm5_next/cuda/verify.py
++++ b/src/tensorfold/families/glm5_next/cuda/verify.py
+@@ -412,8 +412,11 @@ class FullBatchedVerify:
+                     from .forward import dsa_full_cp
+ 
+                     b.topk = self.topk[k]
++                    graph_buckets = getattr(self, 'graph_buckets', None)
+                     self.topk[k] = dsa_full_cp(layer, w, st.kc[di], st.kr[di], st.pos_dev, b, n,
+-                                               keys, st.pos, None, lo=at, rows_only=True)
++                                               keys, st.pos if graph_buckets is None else None,
++                                               None if graph_buckets is None else graph_buckets[k],
++                                               lo=at, rows_only=True)
+                 else:
+                     self.topk[k] = dsa_full_rows(layer, w, st.kc[di], st.kr[di], st.pos_dev, b, n, chunks_for(st, n),
+                                                  keys, st.pos, None, indexed=st.index is not None, topk=self.topk[k],
+diff --git a/tests/test_cp_graph_copy.py b/tests/test_cp_graph_copy.py
+new file mode 100644
+index 00000000..b01f51be
+--- /dev/null
++++ b/tests/test_cp_graph_copy.py
+@@ -0,0 +1,27 @@
++import pytest
++import torch
++from tensorfold.families.glm5_next.cuda.pool import Plane
++from tensorfold.families.glm5_next.cuda.paged_cp import PagedArena
++from tensorfold.families.glm5_next.cuda.paged_copy import position_copy
++
++@pytest.mark.parametrize('width', [64,132,304,528])
++@pytest.mark.parametrize('rank', range(4))
++def test_dynamic_positions_page_edges_and_mapping_change(width,rank):
++    data=(torch.arange(2049*width).reshape(2049,width)%113).to(torch.uint8)
++    arena=PagedArena(8192,[Plane(data,4,1)])
++    view=arena.view(0,2048,4096)
++    staged=torch.empty_like(data[:1025]);pos=torch.tensor([0],dtype=torch.int32)
++    for n in [0,1,3,2039,2047,2048,4079]:
++        pos.fill_(n);rows=9;bound=4096
++        position_copy(view,staged,pos,rows,4,rank,bound)
++        count=min(view.shape[0],(n+rows+3)//4+1)
++        assert torch.equal(staged[:count],view.gather(count))
++        original=data.clone();staged.fill_(71)
++        position_copy(view,staged,pos,rows,4,rank,bound,write=True)
++        lo=max(0,(n+3-rank)//4);hi=max(0,(n+rows+3-rank)//4)
++        expected=original.clone();expected.index_copy_(0,view.indices(lo,hi-lo),staged[lo:hi])
++        assert torch.equal(data,expected)
++    arena.move(2048,0,4096)
++    view=arena.view(0,0,4096);pos.fill_(2051)
++    position_copy(view,staged,pos,9,4,rank,4096)
++    assert torch.equal(staged[:516],view.gather(516))

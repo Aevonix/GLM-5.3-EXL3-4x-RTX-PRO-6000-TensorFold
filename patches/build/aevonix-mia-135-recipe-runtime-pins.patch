@@ -1,0 +1,11 @@
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -1,6 +1,6 @@
+-FROM nvcr.io/nvidia/pytorch:26.07-py3
++FROM nvcr.io/nvidia/pytorch@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c
+ COPY TensorFold /opt/TensorFold
+-RUN pip install --no-cache-dir /opt/TensorFold 'av==18.1.0' 'xgrammar>=0.2.8,<0.3' 'jsonschema>=4.18'
++RUN pip install --no-cache-dir /opt/TensorFold 'av==18.1.0' 'xgrammar==0.2.8' 'jsonschema==4.26.0' 'transformers==5.18.0' 'tokenizers==0.23.1' 'safetensors==0.8.0'
+ RUN python - <<'PYHEADERS'
+ from pathlib import Path
+ import shutil, hashlib, tensorfold

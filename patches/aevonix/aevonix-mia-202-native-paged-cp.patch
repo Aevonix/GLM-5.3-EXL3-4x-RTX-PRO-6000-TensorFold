@@ -1,0 +1,441 @@
+From 487fd981ce4b00e2ea02ccef763cd620877935a6 Mon Sep 17 00:00:00 2001
+From: Aevonix <contact@aevonix.com>
+Date: Mon, 5 Oct 2026 20:57:30 -0400
+Subject: [PATCH] Read and write native FP8 CP pages with unchanged logical row
+ order
+
+---
+ src/tensorfold/families/glm5_next/cuda/dcp.py | 15 ++--
+ .../families/glm5_next/cuda/dsa_full.py       | 18 +++-
+ .../families/glm5_next/cuda/engine.py         |  1 +
+ .../families/glm5_next/cuda/latent.py         | 12 ++-
+ .../families/glm5_next/cuda/mia_index.py      | 10 ++-
+ .../families/glm5_next/cuda/page_address.py   | 28 +++++++
+ .../families/glm5_next/cuda/paged_cp.py       |  9 ++
+ tests/test_cp_native_paged.py                 | 84 +++++++++++++++++++
+ 8 files changed, 161 insertions(+), 16 deletions(-)
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/page_address.py
+ create mode 100644 tests/test_cp_native_paged.py
+
+diff --git a/src/tensorfold/families/glm5_next/cuda/dcp.py b/src/tensorfold/families/glm5_next/cuda/dcp.py
+index 6dec6c86..10f366ba 100644
+--- a/src/tensorfold/families/glm5_next/cuda/dcp.py
++++ b/src/tensorfold/families/glm5_next/cuda/dcp.py
+@@ -30,6 +30,7 @@ from __future__ import annotations
+ import torch
+ import triton
+ import triton.language as tl
++from .page_address import physical_rows, unwrap
+ 
+ from . import kv8, latent
+ from .dsa_full import BT, MIN_BUCKET, ROW_G, SELECT_ROWS, TOPK, _order_key, _wscale, key_args, key_tile
+@@ -74,7 +75,7 @@ def local_cols(pos: int, R: int, rank: int, G: int, slots: int) -> int:
+ @triton.jit
+ def _scores_local(QI, W, w_stride, KEYS, OUT, o_stride, POS, R, NT, rank, scale, wscale, G: tl.constexpr,
+                   H: tl.constexpr, HP: tl.constexpr, D: tl.constexpr, BTT: tl.constexpr, NG: tl.constexpr,
+-                  KS=None, K8: tl.constexpr = 0):
++                  KS=None, K8: tl.constexpr = 0, TABLE=None, PBASE=0, DESC=None, PAGE: tl.constexpr = 0):
+     """Program (row r, g): local token blocks g, g + NG, .. of row r's scores s_t = sum_h w_h relu(scale qi_h . k_t)
+     over the rank's keys KEYS [slots, D] (local slot t: global position t G + rank), for the row's visible local
+     slots t < (pos + r + G - rank) // G, -inf for later columns up to NT. dsa_full._scores' tile ([HP, BTT], keys
+@@ -93,7 +94,8 @@ def _scores_local(QI, W, w_stride, KEYS, OUT, o_stride, POS, R, NT, rank, scale,
+         if tb * BTT >= last:
+             tl.store(OUT + r * o_stride + t, float("-inf"), mask=t < NT)
+         else:
+-            k = key_tile(KEYS, KS, t, t < last, d, D, K8)                                             # [BTT, D]
++            physical = physical_rows(t, t < last, TABLE, PBASE, DESC, PAGE)
++            k = key_tile(KEYS, KS, physical, t < last, d, D, K8)                                             # [BTT, D]
+             q = tl.load(QI + (r * H + hh[:, None]) * D + d[None, :], mask=hok[:, None], other=0.0).to(tl.bfloat16)
+             kr = tl.where((t < nv)[:, None], k, 0.0)
+             dots = tl.dot(q, tl.trans(kr))                                                            # [HP, BTT]
+@@ -154,6 +156,7 @@ def score_local(qi: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, rank: i
+     local index keys [slots, D] (bf16, or TF_GLM_KV=fp4x's e4m3 rows, dequantized exactly): column t is global token
+     t G + rank, with dsa_full.score's bits."""
+ 
++    keys, page = unwrap(keys)
+     H = wts.shape[1]
+     D = kv8.index_width(keys)
+     if qi.shape[1] != H * D or not qi.is_contiguous() or wts.stride(1) != 1 \
+@@ -161,13 +164,13 @@ def score_local(qi: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, rank: i
+         raise ValueError("dcp scores: contiguous index queries [R, H * D], unit-stride weights, contiguous bf16 keys")
+     from . import mia_index
+     if mia_index.applies(R, NT):
+-        return mia_index.score(qi, wts, keys, pos_dev, R, NT, out, rank, G)
++        return mia_index.score(qi, wts, keys, pos_dev, R, NT, out, rank, G, page=page)
+     KEYS, KS, K8 = key_args(keys)
+     if R:
+         ng = min(ROW_G, triton.cdiv(NT, BT))
+         _scores_local[(R, ng)](qi, wts, wts.stride(0), KEYS, out, out.stride(0), pos_dev, R, NT, int(rank),
+                                D ** -0.5, _wscale(H), G=int(G), H=H, HP=max(16, triton.next_power_of_2(H)), D=D,
+-                               BTT=BT, NG=ng, KS=KS, K8=K8, num_warps=4)
++                               BTT=BT, NG=ng, KS=KS, K8=K8, **page, num_warps=4)
+     return out
+ 
+ 
+@@ -305,6 +308,8 @@ def attention_partial(qa: torch.Tensor, qp: torch.Tensor | None, cache: torch.Te
+     fixed grid (k / 512 chunks a row, ``hb`` heads a tile), then the chunks merged in order: a row's bits depend on
+     its queries, its list and the caches only."""
+ 
++    cache, page = unwrap(cache)
++    rope, _ = unwrap(rope)
+     R, H, LW = qa.shape
+     W = slots.shape[1]
+     if not (qa.is_contiguous() and slots.is_contiguous()) or slots.dtype != torch.int32 or slots.shape[0] < R:
+@@ -327,7 +332,7 @@ def attention_partial(qa: torch.Tensor, qp: torch.Tensor | None, cache: torch.Te
+     latent._sparse_chunks[(R, triton.cdiv(H, hb), nch)](qa, vals, scl, slots, counts, po, pm, pl, R, W=W, H=H, LW=LW,
+                                                         CH=CP_CHUNK, SCALE=scale, HBT=hb, KTT=latent.key_tile(cache), RS=rs,
+                                                         FP8=fp8, QP=QP, KR=KR, ROPE=ROPE, FP4=int(kv8.fp4(cache)),
+-                                                        R8=R8, RSW=RSW, num_warps=CP_WARPS,
++                                                        R8=R8, RSW=RSW, **page, num_warps=CP_WARPS,
+                                                         num_stages=CP_STAGES or latent.chunk_stages(cache))
+     _merge_lse[(R, H)](po, pm, pl, o, lse, R, H=H, LW=LW, NCH=nch, num_warps=4)
+     return o, lse
+diff --git a/src/tensorfold/families/glm5_next/cuda/dsa_full.py b/src/tensorfold/families/glm5_next/cuda/dsa_full.py
+index 7041ea06..b290ee19 100644
+--- a/src/tensorfold/families/glm5_next/cuda/dsa_full.py
++++ b/src/tensorfold/families/glm5_next/cuda/dsa_full.py
+@@ -19,6 +19,7 @@ from __future__ import annotations
+ import torch
+ import triton
+ import triton.language as tl
++from .page_address import physical_rows, unwrap
+ 
+ from . import kv8
+ 
+@@ -117,7 +118,8 @@ def index_q_rope(qi: torch.Tensor, heads: int, pos: torch.Tensor, freq: torch.Te
+ 
+ @triton.jit
+ def _k_rope_write(K, k_stride, KR, POS, BASE, FREQ, RANK, HALF: tl.constexpr, SEG: tl.constexpr,
+-                  CP: tl.constexpr = 1, LS=None, LRS: tl.constexpr = 0, RSW: tl.constexpr = 0, R8: tl.constexpr = 0):
++                  CP: tl.constexpr = 1, LS=None, LRS: tl.constexpr = 0, RSW: tl.constexpr = 0, R8: tl.constexpr = 0,
++                  TABLE=None, PBASE=0, DESC=None, PAGE: tl.constexpr = 0):
+     """Row r: its rotary key K[r, :2 HALF] (interleaved pairs) rotated at its position -> cache row (half-split).
+     SEG: position and extent base per row (POS[r], BASE[r]); else pos + r from POS[0]. CP > 1 (not with SEG): only
+     positions p with p % CP == RANK, at row p // CP. R8 (TF_GLM_KV=fp4x): KR an e4m3 plane (2 HALF bytes a row), the
+@@ -134,6 +136,7 @@ def _k_rope_write(K, k_stride, KR, POS, BASE, FREQ, RANK, HALF: tl.constexpr, SE
+             if row % CP != RANK:
+                 return
+             row = row // CP
++    row = physical_rows(row, True, TABLE, PBASE, DESC, PAGE)
+     i = tl.arange(0, HALF)
+     xe = tl.load(K + r * k_stride + 2 * i).to(tl.float32)
+     xo = tl.load(K + r * k_stride + 2 * i + 1).to(tl.float32)
+@@ -170,6 +173,8 @@ def k_rope_write(k: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, freq:
+     (bf16) row pos + r (``cp`` > 1: this rank's positions only, at row p // cp). TF_GLM_KV=fp4x: cache uint8 [slots,
+     rope] codes, each row's scale into ``latent`` (the layer's FP4 latent cache) at the same row."""
+ 
++    cache, page = unwrap(cache)
++    latent, _ = unwrap(latent)
+     half = freq.numel()
+     if k.shape[1] < 2 * half or k.stride(1) != 1 or cache.dtype not in (torch.bfloat16, torch.uint8) \
+             or cache.shape[1] != 2 * half:
+@@ -179,12 +184,13 @@ def k_rope_write(k: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, freq:
+         KR = cache                       # the writer stores code bytes (kv8.e4m3_code), the readers load e4m3
+     if k.shape[0]:
+         _k_rope_write[(k.shape[0],)](k, k.stride(0), KR, pos, pos, freq, int(rank), HALF=half, SEG=False,
+-                                     CP=int(cp), LS=LS, LRS=LRS, RSW=RSW, R8=R8, num_warps=1)
++                                     CP=int(cp), LS=LS, LRS=LRS, RSW=RSW, R8=R8, **page, num_warps=1)
+ 
+ 
+ @triton.jit
+ def _index_write(KR, k_stride, LNW, LNB, IK, POS, FREQ, eps, RANK, D: tl.constexpr, HALF: tl.constexpr,
+-                 CP: tl.constexpr = 1, OUTR: tl.constexpr = 0, BASE=None, SEG: tl.constexpr = 0):
++                 CP: tl.constexpr = 1, OUTR: tl.constexpr = 0, BASE=None, SEG: tl.constexpr = 0,
++                 TABLE=None, PBASE=0, DESC=None, PAGE: tl.constexpr = 0):
+     """Row r: LayerNorm(k_raw[r, :D]) (fp32 statistics, weight and bias), rounded to bf16 as the bf16 LayerNorm
+     returns it, then RoPE on its first 2 HALF dims at position pos + r -> IK[pos + r] (bf16). CP > 1: only
+     positions p with p % CP == RANK, at row p // CP. OUTR (TF_GLM_KV=fp4x's first pass): every row r into IK[r] (a
+@@ -203,6 +209,7 @@ def _index_write(KR, k_stride, LNW, LNB, IK, POS, FREQ, eps, RANK, D: tl.constex
+         if slot % CP != RANK:
+             return
+         slot = slot // CP
++    slot = physical_rows(slot, True, TABLE, PBASE, DESC, PAGE)
+     src = KR + r * k_stride
+     d = tl.arange(0, D)
+     x = tl.load(src + d).to(tl.float32)
+@@ -228,6 +235,9 @@ def index_write(k_raw: torch.Tensor, ln_w: torch.Tensor, ln_b: torch.Tensor, key
+     kernel's rows into a scratch, then kv8.quant_rows8, the one encoder: the bf16 rows' e4m3 codes and fp32 scale,
+     ``kv8.quantize_index8`` of what the bf16 cache would hold, bit for bit on any GPU)."""
+ 
++    keys, page = unwrap(keys)
++    if page and keys.dtype != torch.bfloat16:
++        raise ValueError("native paged index writes require bf16 keys")
+     D = kv8.index_width(keys)
+     if keys.dtype not in (torch.bfloat16, torch.uint8) or not keys.is_contiguous() or k_raw.stride(1) != 1 \
+             or k_raw.shape[1] < D:
+@@ -237,7 +247,7 @@ def index_write(k_raw: torch.Tensor, ln_w: torch.Tensor, ln_b: torch.Tensor, key
+         return
+     if not kv8.index8(keys):
+         _index_write[(R,)](k_raw, k_raw.stride(0), ln_w, ln_b, keys, pos, freq, float(eps), int(rank), D=D,
+-                           HALF=freq.numel(), CP=int(cp), num_warps=1)
++                           HALF=freq.numel(), CP=int(cp), **page, num_warps=1)
+         return
+     rows = torch.empty((R, D), dtype=torch.bfloat16, device=keys.device)
+     _index_write[(R,)](k_raw, k_raw.stride(0), ln_w, ln_b, rows, pos, freq, float(eps), int(rank), D=D,
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index e16103a6..0da438e2 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -992,6 +992,7 @@ class GlmEngine:
+         # TF_GLM_DISK_CACHE (``pcache``): every rank takes part in a disk hit's agreement, so all have it or none
+         disk_on = int(bool(os.environ.get("TF_GLM_DISK_CACHE", "").strip() not in ("", "0", "off")) and parallel == 1)
+         mine.append(disk_on)
++        mine.append(int(os.environ.get("TF_GLM_CP_NATIVE_PAGED", "0")))
+         mine.append(int(os.environ.get("TF_GLM_CP_BATCH_EXCHANGE", "0")))
+         mine.append(self.cp_pool_tokens)
+         mine.append(int(os.environ.get("TF_GLM_CP_PAGED", "0")))
+diff --git a/src/tensorfold/families/glm5_next/cuda/latent.py b/src/tensorfold/families/glm5_next/cuda/latent.py
+index 092cee2d..c0112626 100644
+--- a/src/tensorfold/families/glm5_next/cuda/latent.py
++++ b/src/tensorfold/families/glm5_next/cuda/latent.py
+@@ -7,6 +7,7 @@ import triton
+ import triton.language as tl
+ 
+ from . import LATENT as ENABLED     # off (TF_GLM_LATENT=0): per-head keys and values, 0.3.5's path, for A/B
++from .page_address import physical_rows, unwrap
+ from . import kv8
+ from .kv8 import row_scales
+ 
+@@ -390,7 +391,8 @@ def expand_v(o_lat: torch.Tensor, a, out: torch.Tensor, *, prompt: bool = False)
+ 
+ @triton.jit
+ def _lat_write(LAT, lat_stride, LC, LS, POS, RANK, LW: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr,
+-               CP: tl.constexpr = 1, FP4: tl.constexpr = 0, BASE=None, SEG: tl.constexpr = 0):
++               CP: tl.constexpr = 1, FP4: tl.constexpr = 0, BASE=None, SEG: tl.constexpr = 0,
++               TABLE=None, PBASE=0, DESC=None, PAGE: tl.constexpr = 0):
+     """Row r -> cache slot pos + r: the bf16 row as it is, or (FP8) its codes and scale (kv8.store_row, a function
+     of the row alone: prompt chunks and decode windows store the same bytes). CP > 1 (context parallelism): only
+     positions p with p % CP == RANK, at slot p // CP. SEG (several streams' rows, not with CP): slot BASE[r] +
+@@ -404,6 +406,7 @@ def _lat_write(LAT, lat_stride, LC, LS, POS, RANK, LW: tl.constexpr, RS: tl.cons
+             if P % CP != RANK:
+                 return
+             P = P // CP
++    P = physical_rows(P, True, TABLE, PBASE, DESC, PAGE)
+     k = tl.arange(0, LW)
+     if FP4:                              # TF_GLM_KV=fp4: codes, block scales, row scale (kv8.store_row4)
+         kv8.store_row4(LC, LS, P, tl.load(LAT + r * lat_stride + k).to(tl.float32), LW, RS)
+@@ -415,11 +418,12 @@ def latent_write(lat: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, cp:
+     """lat [R, latent] bf16 rows into cache slots pos .. pos + R - 1 (pos read on the device); an FP8 cache
+     (TF_GLM_KV=fp8) takes each row's e4m3 codes and power-of-two scale. ``cp`` > 1: this rank's positions only
+     (p % cp == rank, at slot p // cp)."""
++    cache, page = unwrap(cache)
+     vals, scl, rs, fp8 = kv8.parts(cache)
+     if lat.shape[1] != kv8.width(cache):
+         raise ValueError(f"latent_write: rows of {lat.shape[1]} into a cache of {kv8.width(cache)}")
+     _lat_write[(lat.shape[0],)](lat, lat.stride(0), vals, scl, pos, int(rank), LW=lat.shape[1], RS=rs, FP8=fp8,
+-                                CP=int(cp), FP4=int(kv8.fp4(cache)), num_warps=4)
++                                CP=int(cp), FP4=int(kv8.fp4(cache)), **page, num_warps=4)
+ 
+ 
+ def latent_write_rows(lat: torch.Tensor, plane: torch.Tensor, pos: torch.Tensor, base: torch.Tensor) -> None:
+@@ -547,7 +551,8 @@ def _dense_chunks(QA, LC, LS, POS, PO, PM, PL, R, H: tl.constexpr, LW: tl.conste
+ def _sparse_chunks(QA, LC, LS, TOK, CNT, PO, PM, PL, R, W: tl.constexpr, H: tl.constexpr, LW: tl.constexpr,
+                    CH: tl.constexpr, SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr, RS: tl.constexpr,
+                    FP8: tl.constexpr, QP=None, KR=None, ROPE: tl.constexpr = 0, FP4: tl.constexpr = 0,
+-                   R8: tl.constexpr = 0, RSW: tl.constexpr = 0):
++                   R8: tl.constexpr = 0, RSW: tl.constexpr = 0,
++                   TABLE=None, PBASE=0, DESC=None, PAGE: tl.constexpr = 0):
+     """Program (row, head block, chunk): HB heads of row r over its selected tokens [c CH, (c + 1) CH) in list order
+     (rotary keys as in ``_dense_chunks``)."""
+     r = tl.program_id(0)
+@@ -570,6 +575,7 @@ def _sparse_chunks(QA, LC, LS, TOK, CNT, PO, PM, PL, R, W: tl.constexpr, H: tl.c
+             idx = c * CH + t * KTT + tl.arange(0, KTT)
+             ok = idx < n
+             tok = tl.load(TOK + r * W + idx, mask=ok, other=0).to(tl.int64)
++            tok = physical_rows(tok, ok, TABLE, PBASE, DESC, PAGE)
+             if FP4:
+                 kv, ks = kv8.load_rows4(LC, LS, tok, ok, k, LW, RS)
+             else:
+diff --git a/src/tensorfold/families/glm5_next/cuda/mia_index.py b/src/tensorfold/families/glm5_next/cuda/mia_index.py
+index 44abf36e..e20a5cd3 100644
+--- a/src/tensorfold/families/glm5_next/cuda/mia_index.py
++++ b/src/tensorfold/families/glm5_next/cuda/mia_index.py
+@@ -3,6 +3,7 @@ import os
+ import triton
+ import triton.language as tl
+ from .dsa_full import key_tile, key_args, _wscale
++from .page_address import physical_rows
+ 
+ ROWS = int(os.environ.get("TF_MIA_INDEX_ROWS", "1"))
+ if ROWS not in (1, 2, 4, 8):
+@@ -14,7 +15,7 @@ def applies(R, NT):
+ @triton.jit
+ def _scores_grouped(QI, W, w_stride, KEYS, OUT, o_stride, POS, R, NT, scale, wscale, RANK: tl.constexpr, WORLD: tl.constexpr, H: tl.constexpr,
+                    HP: tl.constexpr, D: tl.constexpr, BTT: tl.constexpr, RB: tl.constexpr, KS=None,
+-                   K8: tl.constexpr = 0):
++                   K8: tl.constexpr = 0, TABLE=None, PBASE=0, DESC=None, PAGE: tl.constexpr = 0):
+     """_scores for prompt rows, program (RB rows, one token block): the same per-row tile and masks."""
+     rb = tl.program_id(0)
+     tb = tl.program_id(1)
+@@ -30,7 +31,8 @@ def _scores_grouped(QI, W, w_stride, KEYS, OUT, o_stride, POS, R, NT, scale, wsc
+             if r < R:
+                 tl.store(OUT + r * o_stride + t, float("-inf"), mask=t < NT)
+         return
+-    k = key_tile(KEYS, KS, t, t < last, d, D, K8)
++    physical = physical_rows(t, t < last, TABLE, PBASE, DESC, PAGE)
++    k = key_tile(KEYS, KS, physical, t < last, d, D, K8)
+     for i in tl.static_range(RB):
+         r = rb * RB + i
+         if r < R:
+@@ -43,12 +45,12 @@ def _scores_grouped(QI, W, w_stride, KEYS, OUT, o_stride, POS, R, NT, scale, wsc
+             tl.store(OUT + r * o_stride + t, tl.where(t < n, sc, float("-inf")), mask=t < NT)
+ 
+ 
+-def score(qi, wts, keys, pos, R, NT, out, rank=0, world=1):
++def score(qi, wts, keys, pos, R, NT, out, rank=0, world=1, *, page=None):
+     KEYS, KS, K8 = key_args(keys)
+     H = wts.shape[1]
+     D = keys.shape[1] - 4 if K8 else keys.shape[1]
+     _scores_grouped[(triton.cdiv(R, ROWS), triton.cdiv(NT, 64))](
+         qi, wts, wts.stride(0), KEYS, out, out.stride(0), pos, R, NT, D**-.5, _wscale(H),
+         RANK=rank, WORLD=world, H=H, HP=max(16,triton.next_power_of_2(H)), D=D, BTT=64,
+-        RB=ROWS, KS=KS, K8=K8, num_warps=4)
++        RB=ROWS, KS=KS, K8=K8, **(page or {}), num_warps=4)
+     return out
+diff --git a/src/tensorfold/families/glm5_next/cuda/page_address.py b/src/tensorfold/families/glm5_next/cuda/page_address.py
+new file mode 100644
+index 00000000..4d073e6f
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/page_address.py
+@@ -0,0 +1,28 @@
++"""Integer-only logical-to-physical addressing for native paged CP decode."""
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def physical_rows(rows, valid, TABLE, PBASE, DESC, PAGE: tl.constexpr):
++    if PAGE:
++        base = tl.load(DESC).to(tl.int64) if DESC is not None else PBASE
++        local = base + rows
++        return tl.load(TABLE + local // PAGE, valid, other=0) * PAGE + local % PAGE
++    else:
++        return rows
++
++
++class NativeView:
++    def __init__(self, view, descriptor=None):
++        self.tensor = view.tensor
++        self.shape, self.dtype, self.device = view.shape, view.dtype, view.device
++        plane = view.arena.planes[view.plane]
++        self.page = dict(TABLE=view.arena.table, PBASE=view.base // plane.div,
++                         DESC=descriptor, PAGE=2048 // plane.div)
++
++
++def unwrap(value):
++    if isinstance(value, NativeView):
++        return value.tensor, value.page
++    return value, {}
+diff --git a/src/tensorfold/families/glm5_next/cuda/paged_cp.py b/src/tensorfold/families/glm5_next/cuda/paged_cp.py
+index 0108a51b..e9fb9d8a 100644
+--- a/src/tensorfold/families/glm5_next/cuda/paged_cp.py
++++ b/src/tensorfold/families/glm5_next/cuda/paged_cp.py
+@@ -119,6 +119,15 @@ class PagedArena(Arena):
+ def run(fn, layer, w, lc, kr, pos_dev, b, R, keys, host_pos, sparse_np, **kwargs):
+     if not isinstance(lc, PagedView):
+         return fn(layer,w,lc,kr,pos_dev,b,R,keys,host_pos,sparse_np,**kwargs)
++    # Decode only: prefill keeps its qualified gather/pipeline path. Restrict
++    # the initial native path to FP8 latent and bf16 rotary/index planes.
++    if (os.environ.get('TF_GLM_CP_NATIVE_PAGED', '0') == '1' and not b.prefill
++            and lc.dtype == torch.uint8 and kr.dtype == torch.bfloat16
++            and (keys is None or keys.dtype == torch.bfloat16)):
++        from .page_address import NativeView
++        desc = getattr(b, 'cp_graph_descriptor', None) if host_pos is None else None
++        return fn(layer, w, NativeView(lc, desc), NativeView(kr, desc), pos_dev, b, R,
++                  NativeView(keys, desc) if keys is not None else None, host_pos, sparse_np, **kwargs)
+     graph = host_pos is None
+     if graph and not getattr(b, 'cp_graph_positions', False):
+         raise ValueError('paged CP device positions require the concurrent graph wrapper')
+diff --git a/tests/test_cp_native_paged.py b/tests/test_cp_native_paged.py
+new file mode 100644
+index 00000000..a94e734f
+--- /dev/null
++++ b/tests/test_cp_native_paged.py
+@@ -0,0 +1,84 @@
++"""Native/reference kernel identity; CUDA tests need a permitted GPU window."""
++from types import SimpleNamespace
++
++import pytest
++import torch
++import triton
++import triton.language as tl
++
++from tensorfold.families.glm5_next.cuda.page_address import NativeView, physical_rows
++from tensorfold.families.glm5_next.cuda.paged_cp import PagedArena
++from tensorfold.families.glm5_next.cuda.pool import Plane
++
++
++@triton.jit
++def _addresses(ROWS, OUT, TABLE, BASE, DESC, PAGE: tl.constexpr, N: tl.constexpr, B: tl.constexpr):
++    i = tl.arange(0, B)
++    rows = tl.load(ROWS+i, i < N, other=0)
++    mapped = physical_rows(rows, i < N, TABLE, BASE, DESC, PAGE)
++    tl.store(OUT+i, mapped, i < N)
++
++
++def test_integer_addressing_moves_and_dynamic_extents():
++    # Runs with TRITON_INTERPRET=1 on CPU, including nonidentity page tables.
++    arena = PagedArena(16384, [Plane(torch.zeros((4097, 1)), 4, 1)])
++    rows = torch.tensor([0, 1, 510, 511, 512, 513, 1023, 1024], dtype=torch.int64)
++    out = torch.empty_like(rows)
++    desc = torch.tensor([512, 2049], dtype=torch.int32)
++    _addresses[(1,)](rows, out, arena.table, 0, desc, 512, rows.numel(), 8)
++    view = arena.view(0, 2048, 8192)
++    expected = view.indices(0, 1025).index_select(0, rows)
++    assert torch.equal(out, expected)
++    arena.move(2048, 0, 8192)
++    desc[0] = 0
++    _addresses[(1,)](rows, out, arena.table, 512, desc, 512, rows.numel(), 8)
++    assert torch.equal(out, expected)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason='native kernel identity requires CUDA')
++@pytest.mark.parametrize('rank', range(4))
++@pytest.mark.parametrize('position', [2039, 2047, 8190, 131060])
++def test_native_writes_selection_and_attention_equal_staging(rank, position):
++    from tensorfold.families.glm5_next.cuda import dcp, dsa_full, latent
++
++    torch.manual_seed(73)
++    dev, G, R, H, LW, RD, ID, IH = 'cuda', 4, 4, 16, 512, 64, 128, 32
++    capacity = 133120
++    pool = capacity + 4096
++    planes = [Plane(torch.zeros((pool//G+1, LW+16), dtype=torch.uint8, device=dev), G, 1),
++              Plane(torch.randn((pool//G+1, RD), dtype=torch.bfloat16, device=dev), G, 1),
++              Plane(torch.randn((pool//G+1, ID), dtype=torch.bfloat16, device=dev), G, 1)]
++    latent.latent_write(torch.randn((pool//G+1, LW), dtype=torch.bfloat16, device=dev),
++                        planes[0].tensor, torch.zeros(1, dtype=torch.int32, device=dev))
++    arena = PagedArena(pool, planes)
++    views = [arena.view(i, 2048, capacity) for i in range(3)]
++    pos = torch.tensor([position], dtype=torch.int32, device=dev)
++    desc = torch.tensor([2048//G, capacity//G+1], dtype=torch.int32, device=dev)
++    native = [NativeView(v, desc) for v in views]
++    flat = [v.gather() for v in views]
++    lat = torch.randn((R, LW), dtype=torch.bfloat16, device=dev)
++    key = torch.randn((R, RD), dtype=torch.bfloat16, device=dev)
++    raw = torch.randn((R, ID), dtype=torch.bfloat16, device=dev)
++    freq = torch.randn((RD//2,), dtype=torch.float32, device=dev)
++    ln_w = torch.randn((ID,), dtype=torch.bfloat16, device=dev)
++    ln_b = torch.randn_like(ln_w)
++    for lc, kr, ik in (flat, native):
++        latent.latent_write(lat, lc, pos, cp=G, rank=rank)
++        dsa_full.k_rope_write(key, kr, pos, freq, cp=G, rank=rank, latent=lc)
++        dsa_full.index_write(raw, ln_w, ln_b, ik, pos, freq, cp=G, rank=rank)
++    for expected, view in zip(flat, views):
++        assert torch.equal(expected, view.gather())
++    qi = torch.randn((R, IH*ID), dtype=torch.bfloat16, device=dev)
++    wt = torch.randn((R, IH), dtype=torch.bfloat16, device=dev)
++    cols = (position+R+G-1)//G
++    candidates = [dcp.select_local(qi, wt, ik, rank, G, pos, R, cols=cols) for ik in (flat[2], native[2])]
++    assert torch.equal(*candidates)
++    # Ordered local slots straddle pages; partials/LSE must preserve every bit.
++    slots = torch.arange(2048, dtype=torch.int32, device=dev).expand(R, -1).contiguous()
++    counts = torch.full((R,), min(2048, (position+1)//G), dtype=torch.int32, device=dev)
++    qa = torch.randn((R,H,LW), dtype=torch.bfloat16, device=dev)
++    qp = torch.randn((R,H,RD), dtype=torch.bfloat16, device=dev)
++    outputs = [dcp.attention_partial(qa, qp, lc, kr, slots, counts, .1)
++               for lc, kr in ((flat[0],flat[1]), (native[0],native[1]))]
++    for expected, actual in zip(*outputs):
++        assert torch.equal(expected, actual)
+-- 
+2.43.0
+

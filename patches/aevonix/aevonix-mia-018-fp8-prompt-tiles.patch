@@ -1,0 +1,44 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/qmm.py b/src/tensorfold/families/glm5_next/cuda/qmm.py
+index cffedde5..dba85f2b 100644
+--- a/src/tensorfold/families/glm5_next/cuda/qmm.py
++++ b/src/tensorfold/families/glm5_next/cuda/qmm.py
+@@ -276,13 +276,36 @@ F8_PROMPT = {(6432, 4096): (128, 128, 8, 3), (2048, 4096): (64, 64, 8, 3), (4096
+ PROMPT_DEFAULT = (64, 128, 8, 3)
+ 
+ 
++_f8_prompt_env = ("", {})
++
++
++def f8_prompt_tile(n: int, k: int):
++    import os
++    global _f8_prompt_env
++    value = os.environ.get("TF_GLM_F8_PROMPT_TILES", "")
++    if value != _f8_prompt_env[0]:
++        parsed = {}
++        allowed = {(32, 64, 4, 3), (64, 64, 4, 3), (64, 64, 8, 3), (64, 128, 4, 3),
++                   (64, 128, 8, 3), (128, 64, 4, 3), (128, 64, 8, 4), (128, 128, 8, 3)}
++        for item in value.split(",") if value else ():
++            shape, config = item.split(":")
++            key = tuple(map(int, shape.split("x")))
++            tile = tuple(map(int, config.split("x")))
++            if len(key) != 2 or min(key) <= 0 or tile not in allowed:
++                raise ValueError("TF_GLM_F8_PROMPT_TILES: positive NxK:BMxBNxwarpsxstages, supported tile")
++            parsed[key] = tile
++        _f8_prompt_env = value, parsed
++    return _f8_prompt_env[1].get((n, k))
++
++
+ def _prompt_cfg(sk: int, m: int, n: int, k: int):
+     """(BM, BN, warps, stages, seq) for a prompt chunk's matmul, or None below SEQ_ROWS rows."""
+     if m < SEQ_ROWS:
+         return None
+-    if (n, k) in F8_PROMPT:
+-        return (*F8_PROMPT[(n, k)], sk > 1)
+-    return (*PROMPT_DEFAULT, _seq(sk, m, n, k))
++    config = F8_PROMPT.get((n, k), PROMPT_DEFAULT)
++    seq = sk > 1 if (n, k) in F8_PROMPT else _seq(sk, m, n, k)
++    override = f8_prompt_tile(n, k) if m >= 768 else None
++    return (*(override if override is not None else config), seq)
+ 
+ 
+ @triton.jit

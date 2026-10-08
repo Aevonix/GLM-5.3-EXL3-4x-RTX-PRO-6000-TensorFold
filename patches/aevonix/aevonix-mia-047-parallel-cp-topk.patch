@@ -1,0 +1,171 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/dcp.py b/src/tensorfold/families/glm5_next/cuda/dcp.py
+index c03b836c..a1db81b6 100644
+--- a/src/tensorfold/families/glm5_next/cuda/dcp.py
++++ b/src/tensorfold/families/glm5_next/cuda/dcp.py
+@@ -167,6 +167,11 @@ def select_local(qi: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, rank:
+     columns scored (default all of ``keys``' slots; a decode graph's bucket, ``local_cols``), at least the last row's
+     visible local slots. Rows are scored in blocks of SELECT_ROWS (their fp32 scores held at once)."""
+ 
++    from . import mia_par_topk
++    local_nt = int(keys.shape[0] if cols is None else cols)
++    if mia_par_topk.ENABLED and 0 < R <= 16 and local_nt >= 32768:
++        return mia_par_topk.select_local(qi, wts, keys, rank, G, pos_dev, R, k=k, cols=cols, out=out, buf=buf)
++
+     dev = qi.device
+     NT = int(keys.shape[0] if cols is None else cols)
+     if NT > keys.shape[0]:
+diff --git a/src/tensorfold/families/glm5_next/cuda/mia_par_topk.py b/src/tensorfold/families/glm5_next/cuda/mia_par_topk.py
+new file mode 100644
+index 00000000..8ffef319
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/mia_par_topk.py
+@@ -0,0 +1,149 @@
++"""Exact CP top-k with key-tile parallelism for narrow long-context decode.
++
++Four integer radix passes, then ordered compaction. Each pass builds tile-local
++histograms in parallel; no floating-point reduction or atomic output ordering.
++Opt-in TF_MIA_PAR_TOPK=1, dispatched only for <=16 rows and >=32768 local keys.
++"""
++import os
++import torch
++import triton
++import triton.language as tl
++
++ENABLED = os.environ.get("TF_MIA_PAR_TOPK", "0") == "1"
++BLOCK = 8192
++
++
++@triton.jit
++def _key(x):
++    bits = (x + 0.).to(tl.int32, bitcast=True)
++    return (bits ^ ((bits >> 31) | -2147483648)).to(tl.uint32, bitcast=True)
++
++
++@triton.jit
++def _visible(POS, r, NT: tl.constexpr, RANK: tl.constexpr, WORLD: tl.constexpr):
++    return tl.minimum(NT, tl.maximum(0, (tl.load(POS) + r + WORLD - RANK) // WORLD))
++
++
++@triton.jit
++def _hist(S, POS, PREFIX, HIST, STRIDE: tl.constexpr, NT: tl.constexpr,
++          TILES: tl.constexpr, SHIFT: tl.constexpr, RANK: tl.constexpr,
++          WORLD: tl.constexpr, B: tl.constexpr):
++    r, tile = tl.program_id(0), tl.program_id(1)
++    i = tile * B + tl.arange(0, B)
++    np = _visible(POS, r, NT, RANK, WORLD)
++    valid = i < np
++    u = _key(tl.load(S + r.to(tl.int64) * STRIDE + i, valid, other=0.))
++    if SHIFT != 24:
++        prefix = tl.load(PREFIX + r)
++        valid = valid & ((u >> (SHIFT + 8)) == (prefix >> (SHIFT + 8)))
++    hist = tl.histogram(((u >> SHIFT) & 255).to(tl.int32), 256, mask=valid)
++    tl.store(HIST + (r * TILES + tile) * 256 + tl.arange(0, 256), hist)
++
++
++@triton.jit
++def _threshold(HIST, POS, PREFIX, NEED, NT: tl.constexpr, K: tl.constexpr,
++               TILES: tl.constexpr, TP: tl.constexpr, SHIFT: tl.constexpr,
++               RANK: tl.constexpr, WORLD: tl.constexpr):
++    r = tl.program_id(0)
++    t = tl.arange(0, TP)
++    digit = tl.arange(0, 256)
++    h = tl.load(HIST + (r * TILES + t[:, None]) * 256 + digit[None, :],
++                t[:, None] < TILES, other=0)
++    counts = tl.sum(h, 0)
++    if SHIFT == 24:
++        need = tl.minimum(K, _visible(POS, r, NT, RANK, WORLD))
++        prefix = tl.full((), 0, tl.uint32)
++    else:
++        need = tl.load(NEED + r)
++        prefix = tl.load(PREFIX + r)
++    above = tl.sum(counts, 0) - tl.cumsum(counts, 0)
++    chosen = tl.max(tl.where(above + counts >= need, digit, 0), 0)
++    need -= tl.sum(tl.where(digit > chosen, counts, 0), 0)
++    tl.store(PREFIX + r, prefix | (chosen.to(tl.uint32) << SHIFT))
++    tl.store(NEED + r, need)
++
++
++@triton.jit
++def _classify(S, POS, PREFIX, COUNTS, STRIDE: tl.constexpr, NT: tl.constexpr,
++              TILES: tl.constexpr, RANK: tl.constexpr, WORLD: tl.constexpr, B: tl.constexpr):
++    r, tile = tl.program_id(0), tl.program_id(1)
++    i = tile * B + tl.arange(0, B)
++    valid = i < _visible(POS, r, NT, RANK, WORLD)
++    u = _key(tl.load(S + r.to(tl.int64) * STRIDE + i, valid, other=0.))
++    threshold = tl.load(PREFIX + r)
++    tl.store(COUNTS + (r * TILES + tile) * 2, tl.sum((valid & (u > threshold)).to(tl.int32), 0))
++    tl.store(COUNTS + (r * TILES + tile) * 2 + 1, tl.sum((valid & (u == threshold)).to(tl.int32), 0))
++
++
++@triton.jit
++def _compact(S, POS, PREFIX, NEED, COUNTS, OUT, STRIDE: tl.constexpr, NT: tl.constexpr,
++             K: tl.constexpr, TILES: tl.constexpr, TP: tl.constexpr,
++             RANK: tl.constexpr, WORLD: tl.constexpr, B: tl.constexpr):
++    r, tile = tl.program_id(0), tl.program_id(1)
++    np = _visible(POS, r, NT, RANK, WORLD)
++    i = tile * B + tl.arange(0, B)
++    valid = i < np
++    u = _key(tl.load(S + r.to(tl.int64) * STRIDE + i, valid, other=0.))
++    threshold, need = tl.load(PREFIX + r), tl.load(NEED + r)
++    t = tl.arange(0, TP)
++    above_before = tl.sum(tl.load(COUNTS + (r * TILES + t) * 2,
++                                   (t < TILES) & (t < tile), other=0), 0)
++    equal_before = tl.sum(tl.load(COUNTS + (r * TILES + t) * 2 + 1,
++                                   (t < TILES) & (t < tile), other=0), 0)
++    equal = (valid & (u == threshold)).to(tl.int32)
++    take = (valid & (u > threshold)) | ((equal != 0) &
++            (equal_before + tl.cumsum(equal, 0) - equal < need))
++    at = above_before + tl.minimum(equal_before, need) + tl.cumsum(take.to(tl.int32), 0) - 1
++    global_pos = i.to(tl.int64) * WORLD + RANK
++    packed = (u.to(tl.uint64) << 32) | (4294967295 - global_pos).to(tl.uint64)
++    tl.store(OUT + r * K + at, packed.to(tl.int64, bitcast=True), take)
++    if tile == 0:
++        j = tl.arange(0, B)
++        tl.store(OUT + r * K + j, 0, (j < K) & (j >= tl.minimum(np, K)))
++
++
++def select(scores, pos, nt, out, k, rank, world):
++    """Exactly dcp._select_local's packed keys, ascending local position."""
++    if scores.dtype != torch.float32 or scores.ndim != 2 or scores.stride(1) != 1:
++        raise ValueError("parallel top-k: unit-stride FP32 score rows")
++    rows = scores.shape[0]
++    if not (0 <= nt <= scores.shape[1] and 0 < k <= 4096 and 0 <= rank < world):
++        raise ValueError("parallel top-k: invalid dimensions or rank")
++    if out.dtype != torch.int64 or out.shape != (rows, k) or not out.is_contiguous():
++        raise ValueError("parallel top-k: contiguous int64 output [rows,k]")
++    if not scores.is_cuda or out.device != scores.device or pos.device != scores.device or pos.dtype != torch.int32:
++        raise ValueError("parallel top-k: CUDA tensors on one device and int32 position")
++    if rows == 0:
++        return out
++    tiles = max(1, triton.cdiv(nt, BLOCK))
++    prefix = torch.empty(rows, device=scores.device, dtype=torch.uint32)
++    need = torch.empty(rows, device=scores.device, dtype=torch.int32)
++    hist = torch.empty((rows, tiles, 256), device=scores.device, dtype=torch.int32)
++    counts = torch.empty((rows, tiles, 2), device=scores.device, dtype=torch.int32)
++    common = dict(NT=nt, TILES=tiles, RANK=rank, WORLD=world)
++    for shift in (24, 16, 8, 0):
++        _hist[(rows, tiles)](scores, pos, prefix, hist, STRIDE=scores.stride(0), SHIFT=shift,
++                              B=BLOCK, num_warps=8, **common)
++        _threshold[(rows,)](hist, pos, prefix, need, K=k, TP=triton.next_power_of_2(tiles),
++                            SHIFT=shift, num_warps=8, **common)
++    _classify[(rows, tiles)](scores, pos, prefix, counts, STRIDE=scores.stride(0), B=BLOCK,
++                             num_warps=8, **common)
++    _compact[(rows, tiles)](scores, pos, prefix, need, counts, out, STRIDE=scores.stride(0), K=k,
++                            TP=triton.next_power_of_2(tiles), B=BLOCK, num_warps=8, **common)
++    return out
++
++
++def select_local(qi, wts, keys, rank, world, pos, rows, *, k, cols=None, out=None, buf=None):
++    # The public dcp entry point preserves its query/score implementation and
++    # changes only selection. Imports are deferred to avoid a module cycle.
++    from . import dcp
++    nt = int(keys.shape[0] if cols is None else cols)
++    if nt > keys.shape[0]:
++        raise ValueError("parallel top-k: columns past key capacity")
++    cand = torch.empty((rows, k), device=qi.device, dtype=torch.int64) if out is None else out
++    if buf is None or buf.numel() < rows * nt:
++        buf = torch.empty(rows * nt, device=qi.device, dtype=torch.float32)
++    scores = buf[:rows * nt].view(rows, nt)
++    dcp.score_local(qi[:rows], wts[:rows], keys, rank, world, pos, rows, nt, scores)
++    select(scores, pos, nt, cand[:rows], k, rank, world)
++    return cand

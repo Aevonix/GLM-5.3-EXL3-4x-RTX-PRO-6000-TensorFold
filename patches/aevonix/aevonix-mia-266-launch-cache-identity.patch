@@ -1,0 +1,47 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index f492733f..62bb9408 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -1010,6 +1010,12 @@ class GlmEngine:
+                          and os.environ.get("TF_GLM_DISK_CACHE", "").strip() not in ("", "0", "off"))
+         mine.append(multi_disk)
+         disk_on |= multi_disk
++        from .pcache import launch_digest
++
++        # Fixed-width even when a rank disabled the tier: the settings gather
++        # must diagnose that mismatch rather than disagree on collective shapes.
++        fingerprint = launch_digest() if disk_on else "0" * 64
++        mine.extend(int(fingerprint[i:i + 8], 16) & 0x7fffffff for i in range(0, 64, 8))
+         rows = self._gather_ints(mine + [spare >> 20])
+         odd = [r for r, row in enumerate(rows) if row[:-1] != rows[0][:-1]]
+         if odd:
+diff --git a/src/tensorfold/families/glm5_next/cuda/pcache.py b/src/tensorfold/families/glm5_next/cuda/pcache.py
+index c4d34d9d..202a064c 100644
+--- a/src/tensorfold/families/glm5_next/cuda/pcache.py
++++ b/src/tensorfold/families/glm5_next/cuda/pcache.py
+@@ -1024,6 +1024,19 @@ def _folder_digest(folder) -> str:
+     return h.hexdigest()
+ 
+ 
++def launch_digest(environ=None):
++    """Conservative identity for kernel/transport controls omitted by the legacy
++    positional settings list. Cache budgets and I/O policy do not change KV bits.
++    """
++    env = os.environ if environ is None else environ
++    prefixes = ("TF_GLM_", "TF_MIA_", "TF_NCCL_", "NCCL_")
++    excluded = ("TF_GLM_DISK_", "TF_GLM_HOST_", "TF_GLM_CACHE_")
++    values = {k: v for k, v in env.items()
++              if (k.startswith(prefixes) or k in ("TENSORFOLD_NUCLEUS_UNION", "TORCH_CUDA_ARCH_LIST"))
++              and not k.startswith(excluded)}
++    return hashlib.sha256(json.dumps(values, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
++
++
+ def engine_identity(model_dir, drafter_dir, settings: Sequence[int], *, kv: str, world: int, cp: int,
+                     extra: str = "") -> str:
+     """What a kept state's bits depend on besides its tokens: the checkpoint, the draft model, the startup settings
+@@ -1033,4 +1046,4 @@ def engine_identity(model_dir, drafter_dir, settings: Sequence[int], *, kv: str,
+     tag = os.environ.get("TF_GLM_DISK_CACHE_TAG", "").strip()
+     return "|".join([f"tfpc{VERSION}", _folder_digest(model_dir), _folder_digest(drafter_dir),
+                      ",".join(str(int(v)) for v in settings), f"kv={kv}", f"world={world}", f"cp={cp}",
+-                     f"src={source_digest()}", f"tag={tag}", extra])
++                     f"src={source_digest()}", f"launch={launch_digest()}", f"tag={tag}", extra])

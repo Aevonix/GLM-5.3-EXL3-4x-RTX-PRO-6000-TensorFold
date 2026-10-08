@@ -1,0 +1,134 @@
+diff --git a/src/tensorfold/server/metrics.py b/src/tensorfold/server/metrics.py
+index 839b80a01cdf978948c6d12cf7fa8338e08532c2..5c460c50d06f3aa89150bbf65bbedf9edb715753 100644
+--- a/src/tensorfold/server/metrics.py
++++ b/src/tensorfold/server/metrics.py
+@@ -196,16 +196,17 @@ def render(app: Any) -> str:
+                 "This process's physical footprint as the OS counts it, Metal buffers included; "
+                 "only where the platform reports one (macOS).",
+                 [f"{PREFIX}process_footprint_bytes {footprint}"])
+-    # vLLM names, identical values: a vLLM dashboard needs only the "tensorfold:" prefix swapped.
+-    _family(lines, "num_requests_running", "gauge",
+-            "Requests in prefill or decode. A mirror of tensorfold:requests_running.",
+-            [f"{PREFIX}num_requests_running {running}"])
+-    _family(lines, "num_requests_waiting", "gauge",
+-            "Requests queued or held until a lane is free. A mirror of tensorfold:requests_waiting.",
+-            [f"{PREFIX}num_requests_waiting {waiting}"])
+-    _family(lines, "kv_cache_usage_perc", "gauge",
+-            "A stream's cache occupancy under vLLM's name; same streams and ratios as tensorfold:kv_cache_usage_ratio.",
+-            [f'{PREFIX}kv_cache_usage_perc{{stream="{pool}"}} {_num(ratio)}' for pool, ratio in pools])
++    # Keep TensorFold mirrors and expose the same load readings to vLLM clients.
++    for prefix in (PREFIX, "vllm:"):
++        _family(lines, "num_requests_running", "gauge",
++                "Requests in prefill or decode. A mirror of tensorfold:requests_running.",
++                [f"{prefix}num_requests_running {running}"], prefix)
++        _family(lines, "num_requests_waiting", "gauge",
++                "Requests queued or held until a lane is free. A mirror of tensorfold:requests_waiting.",
++                [f"{prefix}num_requests_waiting {waiting}"], prefix)
++        _family(lines, "kv_cache_usage_perc", "gauge",
++                "A stream's cache occupancy under vLLM's name; same streams and ratios as tensorfold:kv_cache_usage_ratio.",
++                [f'{prefix}kv_cache_usage_perc{{stream="{pool}"}} {_num(ratio)}' for pool, ratio in pools], prefix)
+     _family(lines, "spec_decode_num_draft_tokens_total", "counter",
+             "Draft tokens verified on finished requests, this server's single draft counter.",
+             [f"{PREFIX}spec_decode_num_draft_tokens_total {drafted}"])
+diff --git a/tests/test_metrics.py b/tests/test_metrics.py
+index fa709ba9399624ba3586d4a29ca41629a691a808..74cdb710bc56ed0cb264e3b5a85abf9b9d4ec983 100644
+--- a/tests/test_metrics.py
++++ b/tests/test_metrics.py
+@@ -1,6 +1,8 @@
+ """GET /metrics is Prometheus text: running against waiting, tokens, KV, drafts, latency."""
+ 
+ import http.client
++from math import isfinite
++import re
+ import threading
+ import time
+ from http.server import ThreadingHTTPServer
+@@ -319,7 +321,7 @@ def test_the_event_counters_are_read_where_the_server_keeps_them():
+ 
+     cuda = SimpleNamespace(engine=SimpleNamespace(
+         scheduler=SimpleNamespace(decoder=SimpleNamespace(live=lambda: 0, streams={}, filling=()),
+-                                 waiting=Queue(), held=None, yields=4),
++                                 waiting=Queue(), held=None, yields=4, max_streams=4),
+         context_window=100))
+     assert sample(metrics.render(cuda), f"{metrics.PREFIX}preemptions_total") == "4"
+     assert f"{metrics.PREFIX}client_disconnections_total" not in metrics.render(cuda)
+@@ -384,3 +386,79 @@ def test_both_http_layers_serve_the_mirrored_and_event_families(tmp_path):
+         first.join(WAIT)
+         second.join(WAIT)
+         assert box["first"][0] == 200 and box["second"][0] == 200, box
++
++
++# Admission parser fixture (verbatim), used to check the external scrape contract.
++METRICS = {"vllm:num_requests_running": "running", "vllm:num_requests_waiting": "waiting",
++           "vllm:kv_cache_usage_perc": "kv"}
++
++
++def parse_metrics(text):
++    values = {key: [] for key in METRICS.values()}
++    for line in text.splitlines():
++        match = re.match(r"^([^\s{]+)(?:\{.*\})?\s+([^\s]+)(?:\s+[^\s]+)?$", line)
++        if not match or match[1] not in METRICS:
++            continue
++        try:
++            value = float(match[2])
++        except ValueError:
++            return None
++        if not isfinite(value) or value < 0:
++            return None
++        values[METRICS[match[1]]].append(value)
++    if not all(values.values()) or max(values["kv"]) > 1:
++        return None
++    # Assumption: gauges on distinct engine labels are summed; KV uses the
++    # busiest engine, so a healthy shard cannot hide a saturated one.
++    return {"running": sum(values["running"]), "waiting": sum(values["waiting"]), "kv": max(values["kv"])}
++
++
++@pytest.mark.parametrize("lengths, expected_kv", [([], 0), ([0, 25, 100], 1), ([0, 25, 75], 0.75),
++                                               ([0, 50, 150], 1)])
++def test_vllm_load_gauges_are_valid_identical_and_admission_readable(lengths, expected_kv):
++    from prometheus_client.parser import text_string_to_metric_families
++
++    decoder = SimpleNamespace(
++        streams={i: SimpleNamespace(context=list(range(n)), prompt=[]) for i, n in enumerate(lengths)},
++        filling=[], live=lambda: len(lengths), context=100,
++    )
++    app = SimpleNamespace(engine=SimpleNamespace(
++        scheduler=SimpleNamespace(decoder=decoder, waiting=SimpleNamespace(qsize=lambda: 2),
++                                  held=object(), max_streams=4), context_window=100))
++    body = metrics.render(app)
++    assert body.endswith("\n")
++    families = list(text_string_to_metric_families(body))
++    assert len({family.name for family in families}) == len(families)
++    for directive in ("HELP", "TYPE"):
++        names = [line.split()[2] for line in body.splitlines() if line.startswith(f"# {directive} ")]
++        assert len(names) == len(set(names))
++    samples = [s for family in families for s in family.samples]
++    assert len({(s.name, tuple(sorted(s.labels.items()))) for s in samples}) == len(samples)
++    for name in METRICS:
++        family = next(f for f in families if f.name == name)
++        assert family.type == "gauge"
++        assert body.count(f"# HELP {name} ") == body.count(f"# TYPE {name} gauge\n") == 1
++        native = [line.removeprefix("tensorfold:") for line in body.splitlines()
++                  if line.startswith(name.replace("vllm:", "tensorfold:") + " ")
++                  or line.startswith(name.replace("vllm:", "tensorfold:") + "{")]
++        mirrored = [line.removeprefix("vllm:") for line in body.splitlines()
++                    if line.startswith(name + " ") or line.startswith(name + "{")]
++        assert native == mirrored
++    kv = next(f for f in families if f.name == "vllm:kv_cache_usage_perc").samples
++    assert [(s.labels, s.value) for s in kv] == [
++        ({"stream": str(i)}, min(n / 100, 1)) for i, n in enumerate(lengths or [0])]
++    assert all(isfinite(s.value) and 0 <= s.value <= 1 for s in kv)
++    assert parse_metrics(body) == {"running": len(lengths), "waiting": 3, "kv": expected_kv}
++
++
++def test_vllm_load_gauges_are_exposed_on_http_metrics():
++    httpd, thread = serve(SimpleNamespace())
++    try:
++        for path in ("/metrics", "/v1/metrics"):
++            status, content_type, body = get(httpd.server_port, path)
++            assert status == 200 and "version=0.0.4" in content_type
++            assert parse_metrics(body) == {"running": 0, "waiting": 0, "kv": 0}
++    finally:
++        httpd.shutdown()
++        httpd.server_close()
++        thread.join(5)

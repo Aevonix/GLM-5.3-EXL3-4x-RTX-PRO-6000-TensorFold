@@ -1,0 +1,121 @@
+diff --git a/src/tensorfold/cuda/geometry.py b/src/tensorfold/cuda/geometry.py
+index 16c81025..65bfcd09 100644
+--- a/src/tensorfold/cuda/geometry.py
++++ b/src/tensorfold/cuda/geometry.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import math
++import os
+ import re
+ 
+ from .capacity import Geometry, Weights, headers, itemsize
+@@ -395,7 +396,7 @@ def full_token_bytes(t: dict, kv: str = "bf16", mtp: bool = True) -> int:
+ 
+ 
+ def full_buffer_bytes(t: dict, rows: int, *, world: int, share, capacity: int, prefill: bool,
+-                      prompt_split_k: bool) -> int:
++                      prompt_split_k: bool, mtp: bool = True, cp: int = 1) -> int:
+     """What ``forward.Buffers(w, rows, capacity, prefill=...)`` allocates on a rank of full GLM-5.3 (its tensors'
+     bytes, written out from the class; tests/cpu/test_full_memory.py checks the two agree)."""
+     D, V = int(t["hidden_size"]), share("vocab", int(t["vocab_size"]))
+@@ -428,6 +429,12 @@ def full_buffer_bytes(t: dict, rows: int, *, world: int, share, capacity: int, p
+     total += (4 if prefill and not prompt_split_k else 8 * R * 16384 * 4)  # split-K partials
+     total += 2 * R * D * 2 + R * (D // 64) * 4 + (1 if prefill else R) * V * 2   # final norm, logits
+     total += R * D * 2 * 4 + R * (2 * D // 64) * 4                         # MTP rows
++    if os.environ.get("TF_GLM_LEAN_BUFFERS", "0") == "1":
++        total -= R * HL * qk * 2 + R * idim * 4 + P * ml * 2  # unused full-model arrays
++        if not mtp:
++            total -= R * D * 10 + R * (2 * D // 64) * 4
++        if cp > 1:
++            total -= chunks * part_rows * HL * (lw + 2) * 4
+     return total
+ 
+ 
+@@ -490,12 +497,12 @@ def mla_full_geometry(t: dict, world: int, reserve: int, *, share, decode_rows:
+ 
+     def bytes_at(capacity: int) -> int:
+         b = full_buffer_bytes(t, decode_rows, world=world, share=share, capacity=capacity, prefill=False,
+-                              prompt_split_k=prompt_split_k)
++                              prompt_split_k=prompt_split_k, mtp=mtp, cp=cp)
+         if mtp:
+             b += full_buffer_bytes(t, mtp_rows, world=world, share=share, capacity=capacity, prefill=False,
+-                                   prompt_split_k=prompt_split_k)
++                                   prompt_split_k=prompt_split_k, mtp=mtp, cp=cp)
+         b += full_buffer_bytes(t, prefill_rows, world=world, share=share, capacity=capacity, prefill=True,
+-                               prompt_split_k=prompt_split_k)
++                               prompt_split_k=prompt_split_k, mtp=mtp, cp=cp)
+         local = -(-capacity // cp) + (1 if cp > 1 else 0)
+         cp_prompt = full_cp_bytes(t, prefill_rows, cp, prefill=True, share=share)
+         if cp_kv_gather:
+diff --git a/src/tensorfold/families/glm5_next/cuda/forward.py b/src/tensorfold/families/glm5_next/cuda/forward.py
+index f0f97a8a..7ccfa549 100644
+--- a/src/tensorfold/families/glm5_next/cuda/forward.py
++++ b/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -43,6 +43,8 @@ class Buffers:
+         dev = w.device
+         bf, f32 = torch.bfloat16, torch.float32
+         D, S = c.hidden, c.streams
++        lean = c.full and os.environ.get("TF_GLM_LEAN_BUFFERS", "0") == "1"
++        mr = 0 if lean and w.mtp is None else rows + int(pad)
+         HL = tp.of(w).heads
+         LL = tp.of(w).lin_heads
+         self.rows, self.prefill = rows, prefill
+@@ -59,7 +61,8 @@ class Buffers:
+             self.attn = None
+             # a prompt chunk's dense pass runs PROMPT_ATT_ROWS rows at a time (``dense_attention``): its fp32
+             # partials hold that many rows, not the chunk's
+-            self.lat_s = latent.LatentScratch(rows, HL, latent.chunks_for(min(capacity, 2560) + rows), dev,
++            self.lat_s = latent.LatentScratch(rows, HL, (0 if lean and int(w.meta.get("cp", 1)) > 1 else
++                                              latent.chunks_for(min(capacity, 2560) + rows)), dev,
+                                               lw=c.kv_lora, part_rows=PROMPT_ATT_ROWS if prefill else rows)
+             self.att_starts = (torch.arange(0, rows, self.lat_s.part_rows, dtype=torch.int32, device=dev)
+                                if prefill else None)
+@@ -70,7 +73,7 @@ class Buffers:
+             width = kda_layers[0].kda.proj.n if kda_layers else 0
+             self.kproj = torch.zeros((1, rows, width), dtype=bf, device=dev)
+             self.kscratch = kda_mod.KDAScratch(rows, LL, dev)
+-        self.hin = torch.empty((rows, c.hidden), dtype=torch.bfloat16, device=dev)      # MTP input rows
++        self.hin = torch.empty((mr, c.hidden), dtype=torch.bfloat16, device=dev)      # MTP input rows
+         self.zero_first = False          # MTP: this step starts at position 0 (its embedding is zeroed)
+         self.x = torch.empty((rows, S * D), dtype=bf, device=dev)
+         self.normed = torch.empty((rows, D), dtype=bf, device=dev)
+@@ -94,12 +97,12 @@ class Buffers:
+         self.lat = torch.empty((rows, c.kv_lora), dtype=bf, device=dev)
+         self.xs_lat = torch.empty((rows, c.kv_lora // 64), dtype=f32, device=dev)
+         self.q = torch.empty((rows, HL, c.qk_dim), dtype=bf, device=dev)
+-        self.kn = torch.empty((rows, HL, c.qk_dim), dtype=bf, device=dev)
++        self.kn = torch.empty(((0 if lean else rows), HL, c.qk_dim), dtype=bf, device=dev)
+         self.vn = torch.empty((rows, HL, c.v_dim), dtype=bf, device=dev)
+         self.xs_ao = torch.empty((rows, HL * c.v_dim // 64), dtype=f32, device=dev)
+         # DSA indexer (long contexts)
+         self.ikr = torch.empty((rows, c.index_dim + c.index_heads), dtype=bf, device=dev)
+-        self.igr = torch.empty((rows, c.index_dim), dtype=f32, device=dev)
++        self.igr = torch.empty(((0 if lean else rows), c.index_dim), dtype=f32, device=dev)
+         self.qi = torch.empty((rows, c.index_heads * c.index_dim), dtype=bf, device=dev)
+         # dense MLP
+         dl = tp.of(w).dense
+@@ -112,7 +115,7 @@ class Buffers:
+         self.mlog = torch.empty((rows, c.experts), dtype=f32, device=dev)
+         self.pick = torch.empty((rows, slots), dtype=torch.int32, device=dev)
+         self.wts = torch.empty((rows, slots), dtype=f32, device=dev)
+-        self.eact = torch.empty((rows * slots, ml), dtype=bf, device=dev)
++        self.eact = torch.empty(((0 if lean else rows) * slots, ml), dtype=bf, device=dev)
+         exl3 = c.quant == "exl3"
+         # full GLM-5.3: the universal kernels' per-slot outputs (``gx.y``) are the expert rows; no copy of them
+         universal = not c.full and exl3 and w.meta.get("exl3_route") == "universal"
+@@ -174,10 +177,10 @@ class Buffers:
+         self.fxs = torch.empty((rows, D // 64), dtype=f32, device=dev)
+         self.logits = torch.empty((head_rows, w.head.n), dtype=bf, device=dev)
+         # MTP
+-        self.me = torch.empty((rows, D), dtype=bf, device=dev)
+-        self.mcat = torch.empty((rows, 2 * D), dtype=bf, device=dev)
+-        self.mxs = torch.empty((rows, 2 * D // 64), dtype=f32, device=dev)
+-        self.mx = torch.empty((rows, D), dtype=bf, device=dev)
++        self.me = torch.empty((mr, D), dtype=bf, device=dev)
++        self.mcat = torch.empty((mr, 2 * D), dtype=bf, device=dev)
++        self.mxs = torch.empty((mr, 2 * D // 64), dtype=f32, device=dev)
++        self.mx = torch.empty((mr, D), dtype=bf, device=dev)
+         self._parents: dict[int, torch.Tensor] = {}
+         # DFlash2 taps: the mean of the streams after chosen layers (``set_taps``), filled by every forward
+         self.taps: list[torch.Tensor] = []

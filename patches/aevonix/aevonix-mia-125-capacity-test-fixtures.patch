@@ -1,0 +1,150 @@
+diff --git a/tests/test_cuda_capacity.py b/tests/test_cuda_capacity.py
+index 6de7ed9..22c98c8 100644
+--- a/tests/test_cuda_capacity.py
++++ b/tests/test_cuda_capacity.py
+@@ -9,6 +9,8 @@ import pytest
+ 
+ from tensorfold import cli
+ from tensorfold.families.glm5_next.cuda import LATENT
++from tensorfold.families.glm5_next.cuda.engine import MAX_ROWS
++from tensorfold.families.glm5_next.cuda.latent import SPARSE_ONEPASS
+ 
+ 
+ def checkpoint(path, config, tensors):
+@@ -41,11 +43,11 @@ def test_omitted_cuda_context_reaches_engine_as_native(tmp_path, monkeypatch):
+ def test_glm_nonfit_refuses_before_weight_load(tmp_path, monkeypatch):
+     torch = pytest.importorskip("torch")
+     from tensorfold.cuda import capacity
+-    from tensorfold.families.glm5_next.cuda import engine
++    from tensorfold.families.glm5_next.cuda import engine, forward
+     import sys
+ 
+-    glm = SimpleNamespace(dense_limit=2051, mtp_layers=1, layers=4)
+-    weights = SimpleNamespace(Config=SimpleNamespace(read=lambda *a: glm), load=None)
++    glm = SimpleNamespace(dense_limit=2051, mtp_layers=1, layers=4, full=False, quant="mlx", prefix="model.language_model.")
++    weights = SimpleNamespace(Config=SimpleNamespace(read=lambda *a: glm), load=None, exl3_route=lambda *a: "glm")
+     monkeypatch.setitem(sys.modules, "tensorfold.families.glm5_next.cuda.weights", weights)
+     monkeypatch.setitem(sys.modules, "tensorfold.families.glm5_next.cuda.decode", SimpleNamespace(Engine=None))
+ 
+@@ -115,6 +117,8 @@ def fake_runtime(monkeypatch):
+     import torch
+     from tensorfold.cuda import capacity
+ 
++    from tensorfold.families.glm5_next.cuda import forward, weights as glm_weights, draft_dump
++
+     original_tensor, original_empty = torch.tensor, torch.empty
+     def cpu(fn):
+         def call(*a, **kw):
+@@ -138,9 +142,9 @@ def fake_runtime(monkeypatch):
+     monkeypatch.setitem(sys.modules, "tensorfold.cuda.comm", SimpleNamespace(open_comm=lambda *a, **k: comm))
+     for family in ("qwen3_5", "qwen4_exp", "glm5_next"):
+         prefix = f"tensorfold.families.{family}.cuda"
+-        weights = SimpleNamespace(load=load, draft_token_ids=lambda *a: None,
++        weights = SimpleNamespace(load=load, Weights=glm_weights.Weights, exl3_route=lambda *a: "glm", draft_token_ids=lambda *a: None,
+                                   Config=SimpleNamespace(read=lambda *a: SimpleNamespace(dense_limit=2051, mtp_layers=1,
+-                                                                                         layers=4)))
++                                                                                         layers=4, full=False, quant="mlx", prefix="model.language_model.")))
+         monkeypatch.setitem(sys.modules, prefix + ".weights", weights)
+         monkeypatch.setitem(sys.modules, prefix + ".decode", SimpleNamespace(Engine=None))
+     import torch.distributed as dist
+@@ -195,7 +199,7 @@ def test_real_constructors_shrink_default_and_refuse_explicit_before_loading(tmp
+     calls, capacity = fake_runtime
+     from tensorfold.cuda.geometry import gdn_geometry, mla_geometry
+     text = small_config()
+-    geometry = (mla_geometry(text, world, 8, latent=LATENT) if family == "mla" else
++    geometry = (mla_geometry(text, world, MAX_ROWS, latent=LATENT, onepass=SPARSE_ONEPASS) if family == "mla" else
+                 gdn_geometry(text, world, 1 if family == "indexed" else 12, indexed=family == "indexed"))
+     budget = geometry.needed(12000) + 32768
+     monkeypatch.setattr(capacity, "available_bytes", lambda t: budget)
+@@ -293,7 +297,7 @@ def test_actual_distributed_startup_agrees_on_smaller_rank_before_loading(tmp_pa
+ 
+     checkpoint(tmp_path, small_config(), HEAD)
+     calls, capacity = fake_runtime
+-    geom = (mla_geometry(small_config(), 2, 8, latent=LATENT) if family == "mla" else
++    geom = (mla_geometry(small_config(), 2, MAX_ROWS, latent=LATENT, onepass=SPARSE_ONEPASS) if family == "mla" else
+             gdn_geometry(small_config(), 2, 1, indexed=True, kept=5) if family == "indexed" else
+             gdn_geometry(small_config(), 2, 12, rows=12, prompt=4096))     # the 27B engine's, prompt chunks on a GB10
+     transform = split_weights(rule) if family == "mla" else indexed_weights(2, False) if family == "indexed" else linear_weights
+diff --git a/tests/test_cuda_geometry.py b/tests/test_cuda_geometry.py
+index 2896055..3a581a3 100644
+--- a/tests/test_cuda_geometry.py
++++ b/tests/test_cuda_geometry.py
+@@ -131,7 +131,7 @@ def test_mla_latent_estimate_grows_by_the_cache_and_counts_one_prompt_chunk_scra
+         for mtp in (0, 1):
+             g = geometry.mla_geometry({**text, "num_nextn_predict_layers": mtp}, 2, 8, latent=True)
+             count = 2 + mtp
+-            slope = count * lw * 2 + count * index * 2 * 9 // 4 + min(rows, 512)
++            slope = count * lw * 2 + count * index * 2 // 4 + min(rows, 512)
+             assert g.bytes_at(b) - g.bytes_at(a) == (b - a) * slope
+             const[block, mtp] = g.bytes_at(a) - a * slope
+     # one set of partials, with or without the MTP head: 256 more rows of them cost the same in both
+@@ -159,8 +159,8 @@ def test_mla_actual_cache_and_replay_state_are_budgeted(monkeypatch, allocations
+             "num_nextn_predict_layers": int(mtp)}
+     cfg = SimpleNamespace(heads=8, lin_heads=8, conv=4, qk_dim=256, v_dim=256, index_dim=128,
+                           hidden=512, streams=4, q_lora=512, kv_lora=512, index_heads=32,
+-                          dense_width=1024, top_k=2, moe_width=512, experts=8, quant="mlx")
+-    layers = [SimpleNamespace(index=i, kind="kda" if i % 2 == 0 else "dsa",
++                          dense_width=1024, top_k=2, moe_width=512, experts=8, quant="mlx", full=False, rope=0)
++    layers = [SimpleNamespace(index=i, kind="kda" if i % 2 == 0 else "dsa", dsa=None,
+                               kda=SimpleNamespace(proj=SimpleNamespace(n=3 * 4 * 128 + 256 + 4))) for i in range(4)]
+     weights = SimpleNamespace(cfg=cfg, world=2, device="cpu", layers=layers, meta={"long_context": True},
+                               mtp=SimpleNamespace() if mtp else None, head=SimpleNamespace(n=512))
+@@ -171,7 +171,7 @@ def test_mla_actual_cache_and_replay_state_are_budgeted(monkeypatch, allocations
+     if mtp:
+         mod.Buffers(weights, 64, slots)
+     mod.Buffers(weights, 2048, slots, prefill=True)     # the prompt chunks' buffers, as ``decode.Engine`` makes them
+-    mod.State(weights, slots, 64)
++    mod.State(weights, slots, 64, caches=mod.Caches(weights, slots, ring=mod.index_ring(slots, 2048)))
+     estimated = geometry.mla_geometry(text, 2, 8, latent=latent).bytes_at(slots)
+     assert any(slots in t.shape for t in arrays)             # the constructors ran on the fake allocator
+     assert bytes_in(arrays) <= estimated
+@@ -191,8 +191,8 @@ def test_mla_prompt_chunk_latent_partials_hold_one_row_block(monkeypatch, alloca
+     monkeypatch.setattr(cache, "ENABLED", True)
+     cfg = SimpleNamespace(heads=64, lin_heads=8, conv=4, qk_dim=256, v_dim=256, index_dim=128, hidden=512, streams=4,
+                           q_lora=512, kv_lora=512, index_heads=32, dense_width=1024, top_k=2, moe_width=512, experts=8,
+-                          quant="mlx")
+-    layers = [SimpleNamespace(index=i, kind="kda" if i % 2 == 0 else "dsa",
++                          quant="mlx", full=False, rope=0)
++    layers = [SimpleNamespace(index=i, kind="kda" if i % 2 == 0 else "dsa", dsa=None,
+                               kda=SimpleNamespace(proj=SimpleNamespace(n=3 * 4 * 128 + 256 + 4))) for i in range(4)]
+     weights = SimpleNamespace(cfg=cfg, world=2, device="cpu", layers=layers, meta={}, mtp=None,
+                               head=SimpleNamespace(n=512))
+@@ -256,8 +256,8 @@ def test_mla_exl3_scratch_and_buffers_are_budgeted(monkeypatch, allocations, mtp
+             "num_nextn_predict_layers": int(mtp), "_quantization": {"quant_method": "exl3"}}
+     cfg = SimpleNamespace(heads=64, lin_heads=64, conv=4, qk_dim=256, v_dim=256, index_dim=128, hidden=4096,
+                           streams=4, q_lora=1536, kv_lora=512, index_heads=32, dense_width=12288, top_k=8,
+-                          moe_width=2048, shared_width=2048, experts=288, quant="exl3")
+-    layers = [SimpleNamespace(index=i, kind="kda" if i % 2 == 0 else "dsa",
++                          moe_width=2048, shared_width=2048, experts=288, quant="exl3", full=False, rope=0)
++    layers = [SimpleNamespace(index=i, kind="kda" if i % 2 == 0 else "dsa", dsa=None,
+                               kda=SimpleNamespace(proj=SimpleNamespace(n=3 * 32 * 128 + 256 + 32))) for i in range(4)]
+     weights = SimpleNamespace(cfg=cfg, world=2, device="cpu", layers=layers, meta={"long_context": True},
+                               mtp=SimpleNamespace() if mtp else None, head=SimpleNamespace(n=154880 // 2))
+@@ -265,7 +265,7 @@ def test_mla_exl3_scratch_and_buffers_are_budgeted(monkeypatch, allocations, mtp
+     for rows in (8, 64, geometry.PREFILL_ROWS):
+         arrays.clear()
+         exl3_mm.Scratch(rows, slots, d, width, "cpu")
+-        assert bytes_in(arrays) == geometry.exl3_expert_scratch(rows, slots, d, width), rows
++        assert bytes_in(arrays) == geometry.exl3_expert_scratch(rows, slots, d, width, prompt=False), rows
+     arrays.clear()
+     cap = 1 << 20
+     mod.Buffers(weights, 64, cap)
+@@ -273,7 +273,7 @@ def test_mla_exl3_scratch_and_buffers_are_budgeted(monkeypatch, allocations, mtp
+         mod.Buffers(weights, 64, cap)
+     pbuf = mod.Buffers(weights, geometry.PREFILL_ROWS, cap, prefill=True)
+     assert pbuf.sk.numel() == 8 * geometry.PREFILL_ROWS * 16384          # BF16 prompt projections' partials
+-    mod.State(weights, cap, 64)
++    mod.State(weights, cap, 64, caches=mod.Caches(weights, cap, ring=mod.index_ring(cap, geometry.PREFILL_ROWS)))
+     estimated = geometry.mla_geometry(text, 2, 16, latent=True).bytes_at(cap)
+     assert bytes_in(arrays) <= estimated - geometry.mla_chunk_scratch(text, 2, cap, latent=True)
+ 
+diff --git a/tests/test_glm_mtp_setting.py b/tests/test_glm_mtp_setting.py
+index bf788af..fea6abd 100644
+--- a/tests/test_glm_mtp_setting.py
++++ b/tests/test_glm_mtp_setting.py
+@@ -58,4 +58,4 @@ def test_the_geometry_follows_the_setting_not_the_config(latent):
+         on = geometry.mla_geometry(with_head, 2, 16, latent=latent).bytes_at(slots)
+         assert on == geometry.mla_geometry(without, 2, 16, latent=latent, mtp=True).bytes_at(slots)
+         rows = slots * 512 * 2 if latent else slots * 4 * 512 * 2
+-        assert on - off > rows + (2 * slots + slots // 4 + 2) * 128 * 2
++        assert on - off > rows + (2 * geometry.mla_index_ring(slots, geometry.PREFILL_ROWS) + slots // 4 + 2) * 128 * 2

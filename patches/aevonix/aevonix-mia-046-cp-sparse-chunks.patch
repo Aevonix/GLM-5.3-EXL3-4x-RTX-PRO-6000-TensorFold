@@ -1,0 +1,57 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/dcp.py b/src/tensorfold/families/glm5_next/cuda/dcp.py
+index a1db81b6..46106027 100644
+--- a/src/tensorfold/families/glm5_next/cuda/dcp.py
++++ b/src/tensorfold/families/glm5_next/cuda/dcp.py
+@@ -34,6 +34,15 @@ import triton.language as tl
+ from . import kv8, latent
+ from .dsa_full import BT, MIN_BUCKET, ROW_G, SELECT_ROWS, TOPK, _order_key, _wscale, key_args, key_tile
+ 
++# Smaller chunks expose more independent blocks on SM120. Changing CHUNK
++# changes the softmax/merge reduction order: require exact.py and teacher KL.
++import os
++CP_CHUNK = int(os.environ.get("TF_MIA_CP_CHUNK", "512"))
++CP_WARPS = int(os.environ.get("TF_MIA_CP_WARPS", "8"))
++CP_STAGES = int(os.environ.get("TF_MIA_CP_STAGES", "0"))
++if CP_CHUNK not in (64, 128, 256, 512) or CP_WARPS not in (4, 8) or CP_STAGES not in (0, 1, 2, 3):
++    raise ValueError("CP launch: CHUNK=64/128/256/512, WARPS=4/8, STAGES=0/1/2/3 (0 keeps the reference)")
++
+ WORLD = 3            # ranks a context-parallel cache is spread over by default
+ 
+ 
+@@ -297,7 +306,7 @@ def attention_partial(qa: torch.Tensor, qp: torch.Tensor | None, cache: torch.Te
+     W = slots.shape[1]
+     if not (qa.is_contiguous() and slots.is_contiguous()) or slots.dtype != torch.int32 or slots.shape[0] < R:
+         raise ValueError("attention_partial: contiguous queries and int32 local slot lists")
+-    nch = triton.cdiv(W, latent.CHUNK)
++    nch = triton.cdiv(W, CP_CHUNK)
+     n = nch * R * H
+     dev = qa.device
+     o = torch.empty((R, H, LW), dtype=torch.float32, device=dev) if o is None else o
+@@ -313,10 +322,10 @@ def attention_partial(qa: torch.Tensor, qp: torch.Tensor | None, cache: torch.Te
+     vals, scl, rs, fp8 = latent._cache_parts(cache, LW)
+     QP, KR, ROPE, R8, RSW = latent._rope_args(qp, rope, R, H, cache)
+     latent._sparse_chunks[(R, triton.cdiv(H, hb), nch)](qa, vals, scl, slots, counts, po, pm, pl, R, W=W, H=H, LW=LW,
+-                                                        CH=latent.CHUNK, SCALE=scale, HBT=hb, KTT=latent.key_tile(cache), RS=rs,
++                                                        CH=CP_CHUNK, SCALE=scale, HBT=hb, KTT=latent.key_tile(cache), RS=rs,
+                                                         FP8=fp8, QP=QP, KR=KR, ROPE=ROPE, FP4=int(kv8.fp4(cache)),
+-                                                        R8=R8, RSW=RSW, num_warps=8,
+-                                                        num_stages=latent.chunk_stages(cache))
++                                                        R8=R8, RSW=RSW, num_warps=CP_WARPS,
++                                                        num_stages=CP_STAGES or latent.chunk_stages(cache))
+     _merge_lse[(R, H)](po, pm, pl, o, lse, R, H=H, LW=LW, NCH=nch, num_warps=4)
+     return o, lse
+ 
+diff --git a/src/tensorfold/families/glm5_next/cuda/forward.py b/src/tensorfold/families/glm5_next/cuda/forward.py
+index 09330274..a2fdbb27 100644
+--- a/src/tensorfold/families/glm5_next/cuda/forward.py
++++ b/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -1551,7 +1551,8 @@ class CpScratch:
+         self.qp_all = torch.empty((rows, H, RD), dtype=bf, device=dev)
+         self.o = torch.empty((rows, H, LW), dtype=f32, device=dev)
+         self.lse = torch.empty((rows, H), dtype=f32, device=dev)
+-        n = -(-k // latent.CHUNK) * rows * H
++        from .dcp import CP_CHUNK
++        n = -(-k // CP_CHUNK) * rows * H
+         self.parts = (torch.empty((n * LW,), dtype=f32, device=dev), torch.empty((n,), dtype=f32, device=dev),
+                       torch.empty((n,), dtype=f32, device=dev))
+         self.ob = torch.empty((rows, H, LW), dtype=bf, device=dev)

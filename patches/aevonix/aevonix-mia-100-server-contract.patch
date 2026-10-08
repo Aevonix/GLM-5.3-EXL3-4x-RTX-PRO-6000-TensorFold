@@ -1,0 +1,712 @@
+diff --git a/docs/serving-contract.md b/docs/serving-contract.md
+new file mode 100644
+index 0000000..5b857c1
+--- /dev/null
++++ b/docs/serving-contract.md
+@@ -0,0 +1,23 @@
++# Full GLM serving contract
++
++Apply after the recipe's model and compatibility patches. Runtime files are only cuda/server.py,
++cuda/reply_text.py, server/request_options.py, server/tools.py. Install jsonschema>=4.18.
++No numerical engine or family code changes. Use Mia's existing ThinkingOffTemplate: off
++closes the prompt's think block; do not replace it with PR159's low-effort mapping.
++
++Unknown explicit model ids, malformed schemas/choices/thinking controls, non-positive or
++non-integer reply budgets and out-of-range sampling values reject with HTTP400 before
++SSE. Omitted/null budgets retain defaults. Stops match answer text after separation,
++including tool arguments, not reasoning. Truncated tool openers/blocks are never answer
++content; length and disconnect may leave incomplete streamed JSON.
++
++GLM tool headers and argument deltas stream incrementally, including single-call policy.
++IDs/indexes remain stable; string values are escaped incrementally, typed values wait
++for a value closer. Only execute after a successful tool_calls finish, after JSON/schema
++validation. Do not execute on a closing brace alone. Mia's repair of missing arg_key is
++retained for nonstreamed parsing. If repair would disagree with emitted deltas, streaming
++fails and requires a nonstream retry. Do not silently rewrite previously emitted args.
++
++Baseline recipe tests predate max-effort and nullable-parameter support. The accompanying
++test diffs bring those expectations forward and update explicit changed API contracts.
++See the recipe validation report for CPU and live tests and client requirements.
+diff --git a/requirements-server.txt b/requirements-server.txt
+new file mode 100644
+index 0000000..983eae9
+--- /dev/null
++++ b/requirements-server.txt
+@@ -0,0 +1 @@
++jsonschema>=4.18
+diff --git a/src/tensorfold/cuda/reply_text.py b/src/tensorfold/cuda/reply_text.py
+index 55ccf2f..29c171a 100644
+--- a/src/tensorfold/cuda/reply_text.py
++++ b/src/tensorfold/cuda/reply_text.py
+@@ -87,7 +87,7 @@ def hide_tool_calls(text: str, *, finished: bool) -> str:
+         start = text.find(_CALL_OPEN, pos)
+         if start < 0:
+             tail = text[pos:]
+-            out.append(tail[: len(tail) - (0 if finished else _partial_tag(tail, _CALL_OPEN))])
++            out.append(tail[: len(tail) - _partial_tag(tail, _CALL_OPEN)])
+             return "".join(out)
+         out.append(text[pos:start])
+         end = text.find(_CALL_CLOSE, start)
+@@ -96,6 +96,12 @@ def hide_tool_calls(text: str, *, finished: bool) -> str:
+         pos = end + len(_CALL_CLOSE)
+ 
+ 
++def incomplete_tool_call(text: str) -> bool:
++    """Whether finalization withheld a tool block or a prefix of its opening tag."""
++
++    return text.rfind(_CALL_OPEN) > text.rfind(_CALL_CLOSE) or bool(_partial_tag(text, _CALL_OPEN))
++
++
+ def _tool_name(tool: dict[str, Any]) -> str:
+     fn = tool.get("function") if isinstance(tool, dict) else None
+     return str((fn or tool).get("name") or "").strip() if isinstance(tool, dict) else ""
+@@ -138,11 +144,13 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
+                         for key, value in ((p.group(1).strip(), p.group(2))
+                                            for p in _TOOL_PARAMETER_BLOCK_RE.finditer(m.group(2)))}
+             else:
+-                glm = parse_glm_tool_call_block(repair_glm_keys(block), tools, complete=max_calls is not None)
++                glm = parse_glm_tool_call_block(repair_glm_keys(block), tools, complete=True)
+                 if glm is not None:
+                     name, args = glm
+         if not name or str(name).lower() not in known:
+-            if max_calls is None:
++            glm_name = re.match(r"[\w.:-]+", block)
++            malformed_glm = glm_name is not None and glm_name.group(0).lower() in known
++            if max_calls is None and not malformed_glm:
+                 residue.append(match.group(0))
+             continue
+         if max_calls is not None:
+@@ -155,7 +163,12 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
+         calls.append({"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
+                       "function": {"name": known[str(name).lower()],
+                                    "arguments": json.dumps(args, ensure_ascii=False, separators=(",", ":"))}})
+-    residue.append(text[cursor:])
++    # The unmatched tail may hold a truncated opener/block. Completed unknown calls
++    # above retain the pre-existing fallback policy; an incomplete call is never text.
++    tail = text[cursor:]
++    opening = tail.find(_CALL_OPEN)
++    tail = tail[:opening] if opening >= 0 else tail[:len(tail) - _partial_tag(tail, _CALL_OPEN)]
++    residue.append(tail)
+     return "".join(residue).strip(), calls or None
+ 
+ 
+@@ -275,17 +288,16 @@ def _json(value: Any) -> str:
+ 
+ 
+ class GlmCallStreamer:
+-    """GLM's ``<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>`` calls as OpenAI tool-call
+-    deltas: each call is followed while it is written (its arguments' JSON built a string value as it arrives and a
+-    typed one when whole, joining to what ``parse_tool_calls`` gives) and sent whole, header and arguments in one delta,
+-    once its ``</tool_call>`` arrives. A call the reply ends inside (its token limit) is never sent: a client could
+-    store or run its cut arguments.
++    """GLM tool arguments as incremental OpenAI deltas with stable ids and indexes.
+ 
+-    ``feed`` takes the reply's answer so far (text that only grows) and returns the new deltas; ``sent`` counts the
+-    calls sent. A block it cannot follow (not GLM's markup, a tool the request did not offer) is skipped and stays
+-    with the end parser."""
++    String fragments stream as escaped JSON; typed values wait for their closing tag.
++    A length/disconnect may leave incomplete JSON: only successful tool_calls finish
++    authorizes execution. Repairs that would change emitted arguments fail the stream
++    and may be retried nonstreamed. Unknown blocks stay with the final parser.
++    """
+ 
+-    def __init__(self, tools: list[dict[str, Any]]) -> None:
++    def __init__(self, tools: list[dict[str, Any]], *, max_calls: int | None = None) -> None:
++        self.max_calls = max_calls
+         self.tools = tools
+         self.known = {_tool_name(t).lower(): _tool_name(t) for t in tools}
+         self.schemas = parameter_schemas(tools)
+@@ -308,12 +320,15 @@ class GlmCallStreamer:
+             out.append({"tool_calls": [{"index": index, "function": {"arguments": piece}}]})
+ 
+     def feed(self, text: str) -> list[dict[str, Any]]:
+-        self._follow(text)
+-        whole = len(self.calls) - (1 if self.open else 0)
+-        out = [{"tool_calls": [{"index": i, "id": c["id"], "type": "function",
+-                                "function": {"name": c["function"]["name"], "arguments": c["function"]["arguments"]}}]}
+-               for i, c in enumerate(self.calls[self.sent:whole], self.sent)]
+-        self.sent = whole
++        before = [c["function"]["arguments"] for c in self.calls]
++        out = self._follow(text)
++        joined = before + [""] * (len(self.calls) - len(before))
++        for delta in out:
++            for call in delta["tool_calls"]:
++                joined[call["index"]] += call["function"].get("arguments", "")
++        if joined != [c["function"]["arguments"] for c in self.calls]:
++            raise ValueError("GLM repaired arguments differ from stream; retry nonstreamed")
++        self.sent = len(self.calls)       # headers emitted; an unfinished call is never executable
+         return out
+ 
+     def _follow(self, text: str) -> list[dict[str, Any]]:
+@@ -321,6 +336,8 @@ class GlmCallStreamer:
+         while True:
+             rest = text[self.pos:]
+             if self.state == "outside":
++                if self.max_calls is not None and len(self.calls) >= self.max_calls:
++                    return out
+                 at = rest.find(_CALL_OPEN)
+                 if at < 0:
+                     return out
+@@ -352,6 +369,15 @@ class GlmCallStreamer:
+                 self.skipped.append(text[self.start:self.pos])
+             elif self.state == "arguments":             # text between arguments is ignored, as the end parser does
+                 key, close = rest.find(_KEY), rest.find(_CALL_CLOSE)
++                # Preserve Mia's missing-arg_key repair while streaming: the last
++                # bare word before an unmatched </arg_key> is the next key.
++                bare_end = rest.find(_KEY_END)
++                if bare_end >= 0 and (key < 0 or bare_end < key) and (close < 0 or bare_end < close):
++                    word = _LAST_WORD.search(rest, 0, bare_end)
++                    if word is not None:
++                        self.pos += word.start()
++                        self.state = "key"
++                        continue
+                 if close >= 0 and (key < 0 or close < key):
+                     self._args(out, "}" if self.calls[-1]["function"]["arguments"] else "{}")
+                     self.pos, self.state, self.open = self.pos + close + len(_CALL_CLOSE), "outside", False
+@@ -412,7 +438,10 @@ class GlmCallStreamer:
+             return
+         calls = parse_tool_calls(block, self.tools)[1] or []
+         if len(calls) == 1 and calls[0]["function"]["name"] == self.calls[-1]["function"]["name"]:
+-            self.calls[-1]["function"]["arguments"] = calls[0]["function"]["arguments"]
++            repaired = calls[0]["function"]["arguments"]
++            if self.sent >= len(self.calls) and repaired != self.calls[-1]["function"]["arguments"]:
++                raise ValueError("GLM repaired arguments differ from emitted arguments; retry nonstreamed")
++            self.calls[-1]["function"]["arguments"] = repaired
+ 
+     def _callable(self, name: str) -> bool:
+         """Whether the end parser reads a block beginning ``name`` as a GLM call to an offered tool."""
+diff --git a/src/tensorfold/cuda/server.py b/src/tensorfold/cuda/server.py
+index e5b31fb..5d6e5c6 100644
+--- a/src/tensorfold/cuda/server.py
++++ b/src/tensorfold/cuda/server.py
+@@ -28,7 +28,7 @@ from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
+ from tensorfold.cuda import health
+ from tensorfold.cuda.chat_template import ChatTemplate
+ from tensorfold.cuda.reply_text import (THINK_CALL_HOLD, GlmCallStreamer, StopStrings, StreamDecoder, ThinkSplit,
+-                                        close_glm_call, hide_tool_calls, parse_tool_calls)
++                                        close_glm_call, hide_tool_calls, incomplete_tool_call, parse_tool_calls)
+ from tensorfold.cuda.stream_pacing import Playout, smooth_streaming
+ from tensorfold.cuda.turns import Turns, Yield
+ from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
+@@ -125,6 +125,8 @@ class App:
+ 
+         if not isinstance(body, dict):
+             return "the request body must be a JSON object"
++        if "model" in body and body["model"] not in self.model_ids:
++            return "model must be one of: " + ", ".join(self.model_ids)
+         try:
+             probability_options(body, supported=bool(getattr(self.engine, "supports_logprobs", False)))
+         except RequestError as exc:
+@@ -219,12 +221,9 @@ class App:
+     def _requested_tokens(self, body: dict[str, Any]) -> int:
+         for name in ("max_tokens", "max_completion_tokens"):
+             value = body.get(name)
+-            if value is not None:
+-                try:
+-                    int(value)
+-                except (TypeError, ValueError, OverflowError) as exc:
+-                    raise RequestError(f"{name} must be an integer token count") from exc
+-        return max(1, int(body.get("max_tokens") or body.get("max_completion_tokens") or self.max_tokens))
++            if value is not None and (type(value) is not int or value <= 0):
++                raise RequestError(f"{name} must be a positive integer token count")
++        return body.get("max_tokens") or body.get("max_completion_tokens") or self.max_tokens
+ 
+     def _prepare(self, body: dict[str, Any], chat: bool) -> PreparedRequest:
+         from jinja2.exceptions import TemplateError
+@@ -426,7 +425,7 @@ class App:
+         # a streamed reply's GLM calls go out while they are written (a long file write would otherwise send nothing
+         # for minutes, past the idle cut of clients such as LiteLLM and Node's fetch); one call a reply waits
+         glm_calls = bool(tools) and self._glm_calls()
+-        calls_stream = GlmCallStreamer(tools) if glm_calls and body.get("stream") and not policy.single else None
++        calls_stream = GlmCallStreamer(tools, max_calls=policy.max_calls) if glm_calls and body.get("stream") else None
+         quiet_since = [time.monotonic()]     # the last delta sent while a call is held (CALL_KEEPALIVE_S)
+         # other families' calls stream as argument deltas while written (as on the Mac); one-call requests keep the
+         # end parser
+@@ -451,10 +450,10 @@ class App:
+ 
+         def visible(finished: bool) -> tuple[str, str, str]:
+             raw = stream.final() if finished else stream.text
+-            # stop strings match the generated text, reasoning included, before it is split (as on the Mac)
+-            raw = stops.visible(raw, partial=not finished) if stops.strings else raw
+             raw = raw + closing[0] if finished else raw
+             reasoning, answer = split(raw, finished)
++            # Stop matching is confined to the answer, including tool arguments.
++            answer = stops.visible(answer, partial=not finished) if stops.strings else answer
+             answer_raw[0] = answer
+             if tools:
+                 answer = (policy.content(answer, finished=finished) if policy.single
+@@ -498,14 +497,14 @@ class App:
+                 return True
+             try:
+                 if stops.strings:
+-                    kept = []
+-                    for token in new:             # token by token: the round's width cannot move the cut
+-                        kept.append(token)
++                    for token in new:             # drafted width cannot move the answer cut
+                         out.append(token)
+-                        if stops.hit(out):
++                        stream.add([token])
++                        answer = split(stream.text, False)[1]
++                        if any(stop in answer for stop in stops.strings):
+                             stopped["stop"] = True
+                             break
+-                    new = kept
++                    new = []                         # decoded above, including the stop token
+                 else:
+                     out.extend(new)
+                 # smooth streaming: token by token into the playout queue, unless the reply ends in this round (then
+@@ -525,7 +524,7 @@ class App:
+                     wrote = True
+                 parts: list[dict[str, Any]] = []
+                 if calls_stream is not None and not stopped["client"]:
+-                    parts += calls_stream.feed(call_text(raw))
++                    parts += calls_stream.feed(stops.visible(call_text(raw), partial=True) if stops.strings else call_text(raw))
+                     if parts or wrote:
+                         quiet_since[0] = time.monotonic()
+                     elif calls_stream.open and time.monotonic() - quiet_since[0] >= CALL_KEEPALIVE_S:
+@@ -638,23 +637,23 @@ class App:
+         ended = bool(out) and out[-1] in ends and not stopped["stop"]
+         if ended and glm_calls:
+             final_raw = stream.final()
+-            closing[0] = close_glm_call(stops.visible(final_raw) if stops.strings else final_raw, tools)
++            closing[0] = close_glm_call(final_raw, tools)
+         reasoning, answer, raw = visible(True)
+         final: dict[str, Any] = {}
+         if len(reasoning) > sent["reasoning"]:
+             final["reasoning_content"] = reasoning[sent["reasoning"]:]
+         raw_text = self.tok.decode([t for t in out if t not in ends], skip_special_tokens=False)
+-        text = stops.visible(raw_text) + closing[0]
+-        raw_answer = split(text, True)[1]
++        raw_answer = answer_raw[0]
+         content, calls = parse_tool_calls(raw_answer, tools, max_calls=policy.max_calls) if tools else (answer, None)
+         content = policy.content(content) if tools else content
+         call_deltas, streamed = [], 0
+         # the calls streamed as sent, then any the streamer did not follow; calls held in the think block to the end
+         # (never streamed) are the end parser's, sent whole
+         if calls_stream is not None and (think is None or think.stream_from is not None):
+-            call_deltas = calls_stream.feed(call_text(raw))
+-            streamed = calls_stream.sent
+-            calls = [*calls_stream.calls[:streamed], *calls_stream.rest(tools)] or None
++            call_deltas = calls_stream.feed(stops.visible(call_text(raw)) if stops.strings else call_text(raw))
++            whole = len(calls_stream.calls) - int(calls_stream.open)
++            streamed = min(calls_stream.sent, whole)
++            calls = [*calls_stream.calls[:whole], *calls_stream.rest(tools)] or None
+         # a call the token limit cut (the reply ended inside it): never sent, nor its markup as content; one the
+         # model's end token left open that would not parse, its markup as text (``closing`` closed the others)
+         cut = calls_stream is not None and calls_stream.open and not ended
+@@ -667,6 +666,8 @@ class App:
+             final["content"] = tail
+         finish = "tool_calls" if calls and not cut else ("stop" if stopped["stop"] or (out and out[-1] in ends)
+                                                          else "length")
++        if tools and not ended and incomplete_tool_call(raw_answer):
++            finish = "stop" if stopped["stop"] else "length"
+         warning = unanswered(finish, chat and thinking, content, calls)
+         if warning:
+             print(warning, flush=True)
+@@ -680,7 +681,7 @@ class App:
+             streamed = xml_stream.index + 1
+         return {"final": final, "calls": calls, "call_deltas": call_deltas, "calls_streamed": streamed,
+                 "finish": finish, "content": content, "reasoning": reasoning,
+-                "stop_sequence": matched_stop(raw_text, stops.strings),
++                "stop_sequence": matched_stop(split(raw_text, True)[1], stops.strings),
+                 **({"logprobs": logprobs} if logprobs is not None else {}),
+                 "prompt_tokens": len(prompt), "completion_tokens": len(out), "cached_tokens": (cached or [0])[0],
+                 "reasoning_tokens": reasoning_count(out, self.tok.token_to_id("</think>") if chat and thinking else None),
+diff --git a/src/tensorfold/server/request_options.py b/src/tensorfold/server/request_options.py
+index bddc719..5ce89f7 100644
+--- a/src/tensorfold/server/request_options.py
++++ b/src/tensorfold/server/request_options.py
+@@ -32,6 +32,10 @@ def parse_numbers(fields: dict[str, Any]) -> dict[str, Any]:
+         except (ValueError, TypeError, OverflowError) as exc:
+             kind = "an integer" if integer else "a finite number"
+             raise RequestError(f"{name} must be {kind} or null") from exc
++        if name == "temperature" and not 0.0 <= number <= 2.0:
++            raise RequestError("temperature must be between 0 and 2, or null")
++        if name == "top_p" and not 0.0 <= number <= 1.0:
++            raise RequestError("top_p must be between 0 and 1, or null")
+         if name == "min_p" and not 0.0 <= number <= 1.0:
+             raise RequestError("min_p must be between 0 and 1, or null")
+         parsed[name] = max(0, number) if name == "top_k" else number
+@@ -125,10 +129,14 @@ def thinking_fields(body: dict[str, Any], levels: frozenset[str] = frozenset())
+             raise RequestError("reasoning_effort must be none, minimal, low, medium, high, xhigh or max")
+         fields["reasoning_effort"] = coerce_effort(effort, levels)
+         fields["enable_thinking"] = effort != "none"
+-    if isinstance(kwargs, dict) and "enable_thinking" in kwargs:          # an explicit switch wins
+-        fields["enable_thinking"] = bool(kwargs["enable_thinking"])
+-        if fields["enable_thinking"] and fields.get("reasoning_effort") == "none":
+-            fields.pop("reasoning_effort")
++    # Validate both locations even when the top-level value takes precedence.
++    for source in (kwargs if isinstance(kwargs, dict) else {}, body):
++        if "enable_thinking" in source:
++            if type(source["enable_thinking"]) is not bool:
++                raise RequestError("enable_thinking must be a boolean")
++            fields["enable_thinking"] = source["enable_thinking"]
++            if fields["enable_thinking"] and fields.get("reasoning_effort") == "none":
++                fields.pop("reasoning_effort")
+     return fields
+ 
+ 
+diff --git a/src/tensorfold/server/tools.py b/src/tensorfold/server/tools.py
+index d7042f8..656f8d3 100644
+--- a/src/tensorfold/server/tools.py
++++ b/src/tensorfold/server/tools.py
+@@ -27,6 +27,22 @@ def normalize_tool_specs(tools: Any) -> list[dict[str, Any]]:
+             raise ValueError(f"tools[{index}] must be an object")
+         if not tool_spec_name(tool):
+             raise ValueError(f"tools[{index}] must include a function name")
++        function = tool.get("function", tool)
++        if not isinstance(function, dict) or tool.get("type", "function") != "function":
++            raise ValueError(f"tools[{index}] must describe a function")
++        from jsonschema import SchemaError
++        from jsonschema.validators import validator_for
++
++        for field in ("parameters", "input_schema"):
++            if field not in function:
++                continue
++            schema = function[field]
++            if not isinstance(schema, dict):
++                raise ValueError(f"tools[{index}].{field} must be a JSON Schema object")
++            try:
++                validator_for(schema).check_schema(schema)
++            except (SchemaError, TypeError, ValueError, RecursionError) as exc:
++                raise ValueError(f"tools[{index}].{field} is an invalid JSON Schema") from exc
+         normalized.append(tool)
+     return normalized
+ 
+@@ -54,10 +70,12 @@ def tool_choice_requires_call(tool_choice: Any) -> bool:
+ 
+ 
+ def validate_tool_choice(tools: list[dict[str, Any]], tool_choice: Any) -> None:
+-    if not isinstance(tool_choice, dict):
++    if tool_choice is None:
+         return
+-    if str(tool_choice.get("type") or "").lower() != "function":
++    if isinstance(tool_choice, str) and tool_choice in {"auto", "none", "required"}:
+         return
++    if not isinstance(tool_choice, dict) or tool_choice.get("type") != "function":
++        raise ValueError("tool_choice must be auto, none, required, or a named function")
+     function = tool_choice.get("function")
+     if not isinstance(function, dict):
+         raise ValueError("tool_choice function must include a function object")
+@@ -73,6 +91,7 @@ def active_tool_specs(tools: Any, tool_choice: Any) -> list[dict[str, Any]]:
+     """The tools the template offers: none for "none", only the named one for a named function."""
+ 
+     specs = normalize_tool_specs(tools)
++    validate_tool_choice(specs, tool_choice)
+     if tool_choice_disables_tools(tool_choice):
+         return []
+     if not specs:
+diff --git a/tests/test_cuda_admission.py b/tests/test_cuda_admission.py
+index 6cbf209..c8b96d8 100644
+--- a/tests/test_cuda_admission.py
++++ b/tests/test_cuda_admission.py
+@@ -199,7 +199,7 @@ def test_explicit_reply_overflow_refuses_before_generation_and_recovers(model_di
+ 
+ 
+ @pytest.mark.parametrize("chat", [False, True])
+-@pytest.mark.parametrize("options", [{}, {"max_tokens": 0}, {"max_completion_tokens": None}])
++@pytest.mark.parametrize("options", [{}, {"max_tokens": None}, {"max_completion_tokens": None}])
+ def test_omitted_reply_reservation_keeps_default_capping(model_dir, chat, options):
+     engine = FlashEngine()
+     app = server.App(engine, model_dir, "test", max_tokens=9)
+@@ -251,7 +251,7 @@ def test_glm_explicit_reply_refusal_and_request_policy(model_dir):
+     with http_server(app) as port:
+         status, payload = post(port, request(8, False, max_tokens=5, stream=True), False)
+         assert status == 400 and "--context 13" in json.loads(payload)["error"]["message"]
+-        status, _ = post(port, request(8, False, model="test@model-policy", tf_policy="request-policy",
++        status, _ = post(port, request(8, False, model="test", tf_policy="request-policy",
+                                       ignore_eos=True), False)
+     assert status == 200 and engine.calls[0][1] == 4
+     assert engine.policy == "request-policy" and engine.stop_eos is False
+@@ -309,7 +309,7 @@ def test_non_object_json_is_named_http_refusal(model_dir, body):
+ 
+ 
+ @pytest.mark.parametrize("field", ["max_tokens", "max_completion_tokens"])
+-@pytest.mark.parametrize("value", [None, 0])
++@pytest.mark.parametrize("value", [None])
+ def test_zero_or_null_reply_limit_keeps_default(model_dir, field, value):
+     engine = Engine()
+     app = server.App(engine, model_dir, "test", context_window=12, max_tokens=3)
+diff --git a/tests/test_cuda_aliases.py b/tests/test_cuda_aliases.py
+index 2deb0ed..9e92080 100644
+--- a/tests/test_cuda_aliases.py
++++ b/tests/test_cuda_aliases.py
+@@ -38,7 +38,7 @@ def test_without_aliases_models_lists_the_name(tmp_path):
+ 
+ 
+ @pytest.mark.parametrize("asked, named", [("legacy-name", "legacy-name"), ("fake-cuda", "fake-cuda"),
+-                                          ("someone-else", "fake-cuda"), (None, "fake-cuda")])
++                                          (None, "fake-cuda")])
+ def test_a_reply_names_the_id_it_was_asked_for_when_it_answers_to_it(tmp_path, asked, named):
+     app = app_for(tmp_path)
+     app.aliases = ("legacy-name",)
+diff --git a/tests/test_cuda_server_errors.py b/tests/test_cuda_server_errors.py
+index 8de9af9..8439296 100644
+--- a/tests/test_cuda_server_errors.py
++++ b/tests/test_cuda_server_errors.py
+@@ -264,7 +264,7 @@ VALID = [
+     {},
+     {"temperature": 0},
+     {"temperature": 0.0, "seed": 5},
+-    {"temperature": -1},
++    {"temperature": 0},
+     {"temperature": None, "top_k": None, "top_p": None, "seed": None},
+     {"temperature": 0.7},
+     {"temperature": 1},
+diff --git a/tests/test_cuda_stop_strings.py b/tests/test_cuda_stop_strings.py
+index dbb4b16..d118f60 100644
+--- a/tests/test_cuda_stop_strings.py
++++ b/tests/test_cuda_stop_strings.py
+@@ -204,8 +204,9 @@ def test_stop_strings_match_reasoning_and_answer_before_the_split(tmp_path, stre
+     through = len(ids(text[:text.find("STOP") + 4]))
+     assert in_answer == [("The answer is 42. ", "think about it", "stop", through,
+                           server.token_sha(reply_ids[:through]), [])] * 2
+-    through = len(ids("think about"))
+-    assert in_reasoning == [("", "think ", "stop", through, server.token_sha(reply_ids[:through]), [])] * 2
++    through = len(reply_ids)
++    assert in_reasoning == [("The answer is 42. STOP and more", "think about it", "length", through,
++                            server.token_sha(reply_ids), [])] * 2
+ 
+ 
+ @pytest.mark.parametrize("stream", [False, True])
+diff --git a/tests/test_glm_tool_calls.py b/tests/test_glm_tool_calls.py
+index a26324a..7974b89 100644
+--- a/tests/test_glm_tool_calls.py
++++ b/tests/test_glm_tool_calls.py
+@@ -55,7 +55,7 @@ def test_string_arguments_keep_their_exact_text(parser):
+ def test_string_typed_values_that_look_like_json_stay_text(parser):
+     text = ("<tool_call>get_weather<arg_key>units</arg_key><arg_value>null</arg_value>"
+             "<arg_key>zip</arg_key><arg_value>02134</arg_value></tool_call>")
+-    assert _parse(parser, text)[1] == [("get_weather", {"units": "null", "zip": "02134"})]
++    assert _parse(parser, text)[1] == [("get_weather", {"units": None, "zip": "02134"})]
+ 
+ 
+ @PARSERS
+diff --git a/tests/test_serving_contract.py b/tests/test_serving_contract.py
+new file mode 100644
+index 0000000..e039f9f
+--- /dev/null
++++ b/tests/test_serving_contract.py
+@@ -0,0 +1,209 @@
++"""CPU regressions for GLM's always-open reasoning template and native tool stream."""
++import json
++import pytest
++from tensorfold.cuda.chat_template import ChatTemplate
++from tensorfold.cuda.reply_text import parse_tool_calls
++from tensorfold.cuda.reply_text import GlmCallStreamer
++from tensorfold.families.glm5_next.cuda.app import ThinkingOffTemplate
++from tensorfold.server.cancellation import RequestCancelled
++from tests.test_cuda_admission import http_server, post
++from tests.test_cuda_stop_strings import END, Engine, body, events, ids, make_app
++
++TOOLS = [{"type": "function", "function": {"name": "write_file", "parameters": {
++    "type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"},
++        "count": {"type": "integer"}, "options": {"type": "object"}, "flags": {"type": "array"},
++        "active": {"type": "boolean"}, "empty": {"type": "null"}}, "required": ["path"]}}}]
++GLM = ("{# 'low' 'high' 'max' #}{% for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}"
++       "effort={{ reasoning_effort|default('high') }};<|assistant|><think>")
++CALL = '<tool_call>write_file<arg_key>path</arg_key><arg_value>/tmp/example</arg_value></tool_call>'
++
++
++def app_for(tmp_path, text):
++    app = make_app(tmp_path, Engine(ids(text)))
++    (tmp_path / "tokenizer_config.json").write_text(json.dumps({"chat_template": GLM}))
++    app.template = ThinkingOffTemplate(ChatTemplate(tmp_path))
++    app._glm_calls = lambda: True
++    app.default_thinking = True
++    app.aliases = ("glm-alias",)
++    return app
++
++
++def decoded(text, stream):
++    if not stream:
++        data = json.loads(text)
++        choice = data["choices"][0]
++        return choice["message"], choice["finish_reason"]
++    chunks = events(text)
++    assert chunks[0]["choices"][0]["delta"] == {"role": "assistant"}
++    assert text.rstrip().endswith("data: [DONE]")
++    deltas = [c["choices"][0]["delta"] for c in chunks]
++    message = {k: "".join(d.get(k, "") for d in deltas) for k in ("content", "reasoning_content")}
++    return message, chunks[-1]["choices"][0]["finish_reason"]
++
++
++@pytest.mark.parametrize("stream", [False, True])
++@pytest.mark.parametrize("fields", [{"enable_thinking": False}, {"reasoning_effort": "none"},
++    {"chat_template_kwargs": {"enable_thinking": False}}, {"chat_template_kwargs": {"reasoning_effort": "none"}}])
++def test_off_is_low_effort_and_reasoning_never_becomes_content(tmp_path, stream, fields):
++    app = app_for(tmp_path, "café 日本語 😀" + END)
++    request = body(True, stream, **fields)
++    prepared = app.prepare(request, True)
++    assert not prepared.thinking and "<think></think>" in app.tok.decode(prepared.prompt)
++    with http_server(app) as port:
++        status, text = post(port, request, True)
++    message, finish = decoded(text, stream)
++    assert status == 200 and finish == "stop"
++    assert message["content"] == "café 日本語 😀"
++    assert not message.get("reasoning_content")
++
++
++@pytest.mark.parametrize("stream", [False, True])
++def test_stops_ignore_reasoning_and_hold_cross_chunk_answer_prefix(tmp_path, stream):
++    app = app_for(tmp_path, "quote |BETA in thought</think>ALPHA|BETA|GAMMA" + END)
++    with http_server(app) as port:
++        status, text = post(port, body(True, stream, stop="|BETA"), True)
++    message, finish = decoded(text, stream)
++    assert status == 200 and finish == "stop"
++    assert message["content"] == "ALPHA"
++    assert message["reasoning_content"] == "quote |BETA in thought"
++
++
++@pytest.mark.parametrize("stream", [False, True])
++def test_invalid_fields_are_typed_400_before_generation_or_sse(tmp_path, stream):
++    app = app_for(tmp_path, "unused")
++    bad = [{key: value} for key in ("max_tokens", "max_completion_tokens")
++           for value in (0, -1, 1.5, True, False, "8", 8.0)]
++    bad += [{"temperature": value} for value in (-0.1, 2.1, True, "NaN")]
++    bad += [{"top_p": value} for value in (-0.1, 1.1, True)]
++    bad += [{"enable_thinking": value} for value in ("false", None, 0, [])]
++    bad += [{"chat_template_kwargs": {"enable_thinking": value}} for value in ("false", None, 0)]
++    bad += [{"tool_choice": value} for value in ("banana", True, {}, {"type": "banana"},
++        {"type": "function", "function": {"name": "missing"}})]
++    bad += [{"model": value} for value in ("not-a-real-model", None, [], 1)]
++    schemas = ["oops", [], False, {"properties": []}, {"properties": {"x": "oops"}},
++        {"properties": {"x": {"type": "array", "items": {"type": "bogus"}}}}, {"required": "path"}]
++    bad += [{"tools": [{"type": "function", "function": {"name": "bad", "parameters": schema}}],
++             "tool_choice": "required"} for schema in schemas]
++    with http_server(app) as port:
++        for fields in bad:
++            status, text = post(port, body(True, stream, **fields), True)
++            assert status == 400, (fields, status, text)
++            assert json.loads(text)["error"]["type"] == "invalid_request_error"
++        for model in (app.served, "glm-alias"):
++            status, text = post(port, body(True, stream, model=model, max_completion_tokens=8), True)
++            assert status == 200
++    assert len(app.engine.calls) == 2
++
++
++@pytest.mark.parametrize("stream", [False, True])
++@pytest.mark.parametrize("single", [False, True])
++def test_every_tool_truncation_stays_out_of_content_and_finishes_length(tmp_path, stream, single):
++    for cut in range(1, len(CALL)):
++        text = "thought</think>" + CALL[:cut]
++        app = app_for(tmp_path, text)
++        heard = []
++        result = app.run(body(True, stream, tools=TOOLS, parallel_tool_calls=not single,
++                              max_tokens=len(ids(text))), True, lambda d: heard.append(d) or True)
++        assert result["finish"] == "length", cut
++        assert not result["content"] and not result["calls"], cut
++        assert not any(d.get("content") for d in heard), (cut, heard)
++
++
++def test_stop_and_disconnect_in_tool_value_never_flush_markup(tmp_path):
++    text = 'thought</think>' + CALL.replace('/tmp/example', '/tmp/STOPexample')
++    app = app_for(tmp_path, text)
++    heard = []
++    result = app.run(body(True, True, tools=TOOLS, stop="STOP"), True, lambda d: heard.append(d) or True)
++    assert result["finish"] == "stop" and not result["content"] and not result["calls"]
++    assert not any(d.get("content") for d in heard)
++    heard.clear()
++    def emit(delta):
++        heard.append(delta)
++        return not delta.get("tool_calls")
++    with pytest.raises(RequestCancelled):
++        app.run(body(True, True, tools=TOOLS), True, emit)
++    assert not any(d.get("content") for d in heard)
++    assert app.run(body(True, False, tools=TOOLS), True, lambda d: True)["finish"] == "tool_calls"
++
++
++@pytest.mark.parametrize("width", [1, 2, 7, 23, 4096])
++@pytest.mark.parametrize("single", [False, True])
++def test_glm_stream_escaping_types_ids_indexes_and_parallel_calls(width, single):
++    values = {"path": 'a"\\b\n日本語', "content": '\n  café 😀 "line"\\end\n ' * 12, "count": 42,
++              "options": {"nested": [1, True, None, "x"]}, "flags": ["a", 2], "active": True, "empty": None}
++    call = '<tool_call>write_file' + ''.join(
++        '<arg_key>' + k + '</arg_key><arg_value>' + (v if isinstance(v, str) else json.dumps(v)) + '</arg_value>'
++        for k, v in values.items()) + '</tool_call>'
++    text = call + CALL
++    streamer = GlmCallStreamer(TOOLS, max_calls=1 if single else None)
++    deltas, progress = [], []
++    for end in range(width, len(text) + width, width):
++        got = streamer.feed(text[:end])
++        deltas.extend(got)
++        progress.extend((end, d) for d in got)
++    calls = {}
++    for delta in deltas:
++        for c in delta["tool_calls"]:
++            item = calls.setdefault(c["index"], {"id": c.get("id"), "name": "", "arguments": ""})
++            for key, value in c["function"].items():
++                item[key] += value
++    assert sorted(calls) == ([0] if single else [0, 1])
++    assert len({c["id"] for c in calls.values()}) == len(calls)
++    assert json.loads(calls[0]["arguments"]) == values
++    if not single:
++        assert json.loads(calls[1]["arguments"]) == {"path": "/tmp/example"}
++    _, parsed = parse_tool_calls(text, TOOLS, max_calls=1 if single else None)
++    assert [json.loads(c["arguments"]) for c in calls.values()] == [json.loads(c["function"]["arguments"]) for c in parsed]
++    if width < len(call):
++        assert any(end < len(call) and len(d["tool_calls"][0]["function"].get("arguments", "")) > 1 for end, d in progress)
++
++
++@pytest.mark.parametrize("stream", [False, True])
++def test_completed_tools_with_off_and_streamed_ids_match_final(tmp_path, stream):
++    app = app_for(tmp_path, CALL + CALL + END)
++    heard = []
++    result = app.run(body(True, stream, tools=TOOLS, enable_thinking=False), True, lambda d: heard.append(d) or True)
++    sent_ids = [c["id"] for d in heard for c in d.get("tool_calls", []) if "id" in c]
++    assert not stream or sent_ids == [c["id"] for c in result["calls"]]
++    assert result["finish"] == "tool_calls" and not result["content"]
++    assert not result["reasoning"] and (not stream or len(set(sent_ids)) == 2)
++
++
++@pytest.mark.parametrize("suffix", ["<", "<tool", "<tool_call>write_file<arg_key>"])
++def test_length_after_complete_call_and_partial_next_call(tmp_path, suffix):
++    text = "thought</think>" + CALL + suffix
++    app = app_for(tmp_path, text)
++    result = app.run(body(True, True, tools=TOOLS, max_tokens=len(ids(text))), True, lambda d: True)
++    assert result["finish"] == "length" and len(result["calls"]) == 1 and not result["content"]
++
++
++@pytest.mark.parametrize("single", [False, True])
++def test_premature_outer_close_does_not_expose_incomplete_glm_arguments(tmp_path, single):
++    text = "thought</think><tool_call>write_file<arg_key>path</arg_key><arg_value>/tmp/x</tool_call>"
++    app = app_for(tmp_path, text)
++    heard = []
++    result = app.run(body(True, True, tools=TOOLS, max_tokens=len(ids(text)), parallel_tool_calls=not single),
++                     True, lambda d: heard.append(d) or True)
++    assert result["finish"] == "length" and not result["calls"] and not result["content"]
++    assert not any(d.get("content") for d in heard)
++
++
++@pytest.mark.parametrize("width", [1, 2, 7, 4096])
++def test_incremental_repaired_keys_match_nonstreamed_mia_parser(width):
++    # Preserve Mia's repair of a missing arg_key after an already streamed argument.
++    text = ('<tool_call>write_file<arg_key>path</arg_key><arg_value>/tmp/x</arg_value>'
++            'content</arg_key><arg_value>hello</arg_value></tool_call>')
++    streamer=GlmCallStreamer(TOOLS);arguments=""
++    for n in range(width,len(text)+width,width):
++        for d in streamer.feed(text[:n]):
++            arguments += d['tool_calls'][0]['function'].get('arguments','')
++    _, calls=parse_tool_calls(text,TOOLS)
++    assert json.loads(arguments)==json.loads(calls[0]['function']['arguments'])=={'path':'/tmp/x','content':'hello'}
++
++
++def test_reasoning_stop_does_not_disable_eos_tool_repair(tmp_path):
++    # Mia's existing EOS repair remains available when a stop appears only in thought.
++    app = app_for(tmp_path, 'quote STOP</think>'+CALL.removesuffix('</tool_call>')+END)
++    a=app.run(body(True, False, tools=TOOLS, stop='STOP'),True,lambda d:True)
++    assert a['finish']=='tool_calls' and a['reasoning']=='quote STOP'
++    assert json.loads(a['calls'][0]['function']['arguments'])=={'path':'/tmp/example'}
+diff --git a/tests/test_tool_parameter_untyped.py b/tests/test_tool_parameter_untyped.py
+index 54fcb3f..cbdddc1 100644
+--- a/tests/test_tool_parameter_untyped.py
++++ b/tests/test_tool_parameter_untyped.py
+@@ -7,7 +7,7 @@ from tensorfold.tool_parameters import decode_parameter, typed_parameter
+ 
+ @pytest.mark.parametrize("schema,value", [
+     ({}, "None"),                          # no type at all
+-    ({"type": ["integer", "null"]}, "5"),   # a list where a type name belongs
++    ({"type": ["bogus", "null"]}, "5"),   # a list where a type name belongs
+     ({"type": "weird"}, "None"),            # a name the type dict does not name
+     ({"type": "string"}, "7.5"),            # a scalar type that takes no decode path
+ ])

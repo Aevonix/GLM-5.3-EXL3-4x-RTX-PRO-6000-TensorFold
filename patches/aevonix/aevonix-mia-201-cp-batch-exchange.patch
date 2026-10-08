@@ -1,0 +1,254 @@
+From 57ee612ae4c87847108b4c7e125eab66efb69542 Mon Sep 17 00:00:00 2001
+From: Aevonix <contact@aevonix.com>
+Date: Mon, 5 Oct 2026 20:53:55 -0400
+Subject: [PATCH] Batch concurrent CP candidate, query and attention exchanges
+ per layer
+
+---
+ .../families/glm5_next/cuda/cp_batch.py       | 115 ++++++++++++++++++
+ .../families/glm5_next/cuda/engine.py         |   1 +
+ .../families/glm5_next/cuda/verify.py         |   7 ++
+ tests/test_cp_batch_exchange.py               |  71 +++++++++++
+ 4 files changed, 194 insertions(+)
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/cp_batch.py
+ create mode 100644 tests/test_cp_batch_exchange.py
+
+diff --git a/src/tensorfold/families/glm5_next/cuda/cp_batch.py b/src/tensorfold/families/glm5_next/cuda/cp_batch.py
+new file mode 100644
+index 00000000..a18b82fe
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/cp_batch.py
+@@ -0,0 +1,115 @@
++"""Concurrent CP transport, with one collective per phase for the whole layer.
++
++Each stream retains its selection and attention kernel calls, local token order,
++chunk size and rank-order merge. Only the transport's row dimension is packed.
++The paged reference stages twice; native page addressing can remove both copies.
++"""
++import torch
++
++
++def mix(verify, layer):
++    from . import dcp, dsa_full, latent
++    from .forward import cp_all_visible, cp_scratch, dsa_full_front, dsa_full_out, mm
++    from .paged_cp import run
++
++    w, b, R = verify.w, verify.b, verify.R
++    c, a = w.cfg, layer.dsa
++    G, rank, HP = int(w.meta['cp']), int(w.rank), int(w.meta['cp_heads'])
++    LW, RD, HL = c.kv_lora, c.rope, a.heads
++    freq = w.meta['rope_freq']
++    graph_buckets = getattr(verify, 'graph_buckets', None)
++    dynamic = graph_buckets is not None and getattr(verify, 'dynamic_extents', False)
++    dsa_full_front(layer, w, b, 0, R)
++    work, at = [], 0
++    for k, seg in enumerate(verify.segments):
++        st, n = seg.st, len(seg.tokens)
++        di = st.dsa_index[layer.index]
++        keys = None if st.index is None or a.index is None else st.index[st.index_of[layer.index]][2]
++        desc = verify.metadata[k, :2] if dynamic else None
++        pos = verify.metadata[k, 2:3] if dynamic else st.pos_dev
++        host = st.pos if graph_buckets is None else None
++        bucket = None if graph_buckets is None else graph_buckets[k]
++        within = ((host + n <= c.index_topk) if host is not None else bucket is None) and c.dense_limit <= c.index_topk
++        work.append((k, slice(at, at+n), n, st.kc[di], st.kr[di], keys, pos, host, bucket, desc, within))
++        at += n
++    # Graph verification preallocates this to the pool capacity. The eager path
++    # sizes it to the largest extent before any candidate buffer is retained.
++    largest = max((x[5] if x[5] is not None else x[3] for x in work), key=lambda x: x.shape[0])
++    sc = cp_scratch(w, b, largest)
++    selected = []
++
++    for k, rs, n, lc, kr, keys, pos, host, bucket, desc, within in work:
++        b.cp_graph_descriptor = desc
++
++        def prepare(layer, w, lc, kr, pos, b, n, keys, host, bucket):
++            latent.latent_write(b.lat[rs], lc, pos, cp=G, rank=rank)
++            dsa_full.k_rope_write(b.dp[rs, c.q_lora+c.kv_lora:], kr, pos, freq, cp=G, rank=rank, latent=lc)
++            dsa_full.q_rope(b.q[rs], b.qp[rs], pos, freq, c.nope)
++            ix = a.index
++            if ix is not None and keys is not None:
++                mm(b, b.normed[rs], ix.kw, b.xs[rs], b.ikr[rs])
++                dsa_full.index_write(b.ikr[rs, :c.index_dim], ix.ln_w, ix.ln_b, keys, pos, freq, cp=G, rank=rank)
++                if within:
++                    verify.topk[k] = tuple(t.clone() for t in cp_all_visible(w, b, n, pos, G, rank, c.index_topk))
++                else:
++                    mm(b, b.qr[rs], ix.qb, b.xs_qr[rs], b.qi[rs])
++                    dsa_full.index_q_rope(b.qi[rs], c.index_heads, pos, freq)
++                    cols = (max(1, dcp.visible_local(host+n-1, rank, G)) if host is not None else
++                            min(keys.shape[0], -(-int(bucket or c.dense_limit)//G)+1))
++                    dcp.select_local(b.qi[rs], b.ikr[rs, c.index_dim:], keys, rank, G, pos, n,
++                                     k=c.index_topk, cols=cols, out=sc.cand[rs], buf=sc.sel)
++                    selected.append((k, rs, n))
++            elif verify.topk[k] is None:
++                raise RuntimeError('shared indexer layer needs the preceding selection')
++            latent.absorb_q(b.q[rs], a.absorb, b.lat_s.qa[rs], prompt=False)
++
++        run(prepare, layer, w, lc, kr, pos, b, n, keys, host, bucket)
++
++    if selected:
++        # Dense and shared-index rows have no candidates; zero them so padding
++        # never transports uninitialized data. They are not merged below.
++        selected_keys = {k for k, _, _ in selected}
++        for k, rs, *_ in work:
++            if k not in selected_keys:
++                sc.cand[rs].zero_()
++        every = sc.every[:G*R*c.index_topk].view(G, R, c.index_topk)
++        w.comm.all_gather(sc.cand[:R].reshape(-1), every.reshape(-1))
++        for k, rs, n in selected:
++            verify.topk[k] = dcp.select_merge(every[:, rs].contiguous(), rank, G, c.index_topk)
++
++    mine = sc.mine[:R]
++    mine.zero_()
++    mine[:, :HL, :LW].copy_(b.lat_s.qa[:R])
++    mine[:, :HL, LW:].copy_(b.qp[:R])
++    allq = sc.allq[:G*R*HP*(LW+RD)]
++    w.comm.all_gather(mine.reshape(-1), allq)
++    allq = allq.view(G, R, HP, LW+RD).permute(1, 0, 2, 3)
++    sc.qa_all[:R].view(R, G, HP, LW).copy_(allq[..., :LW])
++    sc.qp_all[:R].view(R, G, HP, RD).copy_(allq[..., LW:])
++
++    for k, rs, n, lc, kr, keys, pos, host, bucket, desc, within in work:
++        b.cp_graph_descriptor = desc
++
++        def attend(layer, w, lc, kr, pos, b, n, keys, host, bucket):
++            tokens, counts = verify.topk[k]
++            dcp.attention_partial(sc.qa_all[rs], sc.qp_all[rs], lc, kr, tokens, counts, c.qk_dim**-0.5,
++                                  o=sc.o[rs], lse=sc.lse[rs], parts=sc.parts)
++
++        run(attend, layer, w, lc, kr, pos, b, n, None, host, bucket)
++
++    ob = sc.ob[:R]
++    ob.copy_(sc.o[:R])
++    so = sc.send_o[:G*R*HP*LW].view(G, R, HP, LW)
++    sl = sc.send_l[:G*R*HP].view(G, R, HP)
++    so.copy_(ob.view(R, G, HP, LW).permute(1, 0, 2, 3))
++    sl.copy_(sc.lse[:R].view(R, G, HP).permute(1, 0, 2))
++    got_o = sc.got_o[:G*R*HP*LW].view(G, R, HP, LW)
++    got_l = sc.got_l[:G*R*HP].view(G, R, HP)
++    got_o[rank].copy_(so[rank])
++    got_l[rank].copy_(sl[rank])
++    w.comm.exchange_all({p: [so[p], sl[p]] for p in range(G) if p != rank},
++                        {p: [got_o[p], got_l[p]] for p in range(G) if p != rank})
++    merged = dcp.merge_ranks(sc.got_f[:G*R*HP*LW].view(G, R, HP, LW).copy_(got_o), got_l,
++                              out=sc.merged[:R])
++    b.lat_s.ol[:R].copy_(merged[:, :HL])
++    return dsa_full_out(layer, w, b, R)
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 8d1a2485..e16103a6 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -992,6 +992,7 @@ class GlmEngine:
+         # TF_GLM_DISK_CACHE (``pcache``): every rank takes part in a disk hit's agreement, so all have it or none
+         disk_on = int(bool(os.environ.get("TF_GLM_DISK_CACHE", "").strip() not in ("", "0", "off")) and parallel == 1)
+         mine.append(disk_on)
++        mine.append(int(os.environ.get("TF_GLM_CP_BATCH_EXCHANGE", "0")))
+         mine.append(self.cp_pool_tokens)
+         mine.append(int(os.environ.get("TF_GLM_CP_PAGED", "0")))
+         mine.extend([int(os.environ.get("TF_GLM_CP_MULTI_GRAPHS", "0")),
+diff --git a/src/tensorfold/families/glm5_next/cuda/verify.py b/src/tensorfold/families/glm5_next/cuda/verify.py
+index 6d8899f7..43b86916 100644
+--- a/src/tensorfold/families/glm5_next/cuda/verify.py
++++ b/src/tensorfold/families/glm5_next/cuda/verify.py
+@@ -322,7 +322,10 @@ class FullBatchedVerify:
+         c = w.cfg
+         if not c.full:
+             raise ValueError("FullBatchedVerify is full GLM-5.3's (GLM-5.3-Flash: BatchedVerify)")
++        import os
++
+         self.cp = int(w.meta.get("cp", 1))
++        self.batch_cp = os.environ.get("TF_GLM_CP_BATCH_EXCHANGE", "0") == "1"
+         if not latent.ENABLED:
+             raise ValueError("batched verify windows need the latent cache (TF_GLM_LATENT=1)")
+         if not 1 <= rows <= FULL_MAX_ROWS:
+@@ -397,6 +400,10 @@ class FullBatchedVerify:
+         if layer.kind != "dsa":
+             raise ValueError(f"layer {layer.index}: full GLM-5.3 has attention layers only")
+         w, b, R = self.w, self.b, self.R
++        if self.cp > 1 and self.batch_cp:
++            from .cp_batch import mix
++
++            return mix(self, layer)
+         with prof.timed("dsa (total)"):
+             dsa_full_front(layer, w, b, 0, R)
+             at = 0
+diff --git a/tests/test_cp_batch_exchange.py b/tests/test_cp_batch_exchange.py
+new file mode 100644
+index 00000000..214bd9d0
+--- /dev/null
++++ b/tests/test_cp_batch_exchange.py
+@@ -0,0 +1,71 @@
++"""Exercise batch row packing with deterministic transport and kernel stand-ins."""
++from types import SimpleNamespace as NS
++
++import torch
++from tensorfold.families.glm5_next.cuda import cp_batch, forward, latent, dsa_full, dcp
++from tensorfold.families.glm5_next.cuda.verify import Segment
++
++
++def test_collectives_pack_rows_once_and_preserve_segment_order(monkeypatch):
++    G, R, HP, LW, RD, K = 4, 5, 2, 2, 2, 2
++    calls = []
++    class Comm:
++        def all_gather(self, mine, every):
++            calls.append(('gather', mine.numel(), mine.dtype))
++            for g in range(G):
++                every.view(G,-1)[g].copy_(mine+g*10)
++        def exchange_all(self, sends, recvs):
++            calls.append(('exchange', len(sends)))
++            for p in sends:
++                for src,dst in zip(sends[p],recvs[p]):
++                    dst.copy_(src)
++    def empty(*shape,dtype=torch.float32):
++        return torch.empty(shape,dtype=dtype)
++    sc = NS(cand=empty(R,K,dtype=torch.int64),every=empty(G*R*K,dtype=torch.int64),sel=None,
++            mine=empty(R,HP,LW+RD),allq=empty(G*R*HP*(LW+RD)),qa_all=empty(R,G*HP,LW),
++            qp_all=empty(R,G*HP,RD),o=empty(R,G*HP,LW),lse=empty(R,G*HP),parts=None,
++            ob=empty(R,G*HP,LW),send_o=empty(G*R*HP*LW),send_l=empty(G*R*HP),
++            got_o=empty(G*R*HP*LW),got_l=empty(G*R*HP),got_f=empty(G*R*HP*LW),merged=empty(R,HP,LW))
++    cfg=NS(index_topk=K,dense_limit=K,q_lora=0,kv_lora=LW,rope=RD,nope=0,index_dim=2,index_heads=2,qk_dim=4)
++    w=NS(cfg=cfg,meta=dict(cp=G,cp_heads=HP,rope_freq=None),rank=0,comm=Comm())
++    a=NS(heads=HP,index=NS(kw=None,ln_w=None,ln_b=None,qb=None),absorb=None)
++    b=NS(prefill=False,lat=empty(R,LW),dp=empty(R,LW+RD),q=torch.arange(R*HP*LW).reshape(R,HP,LW).float(),
++         qp=torch.zeros(R,HP,RD),normed=empty(R,LW),xs=empty(R,LW),ikr=empty(R,4),
++         qr=empty(R,LW),xs_qr=empty(R,LW),qi=empty(R,LW),lat_s=NS(qa=empty(R,HP,LW),ol=empty(R,HP,LW)))
++    states=[NS(dsa_index={0:0},kc=[torch.full((32,2),float(v))],kr=[empty(32,2)],
++               index_of={0:0},index=[(None,None,empty(32,2))],pos=10,pos_dev=torch.tensor([10])) for v in (3,7)]
++    verify=NS(w=w,b=b,R=R,segments=[Segment(states[0],[1,2]),Segment(states[1],[3,4,5])],topk=[None,None])
++    monkeypatch.setattr(forward,'dsa_full_front',lambda *a:None)
++    monkeypatch.setattr(forward,'dsa_full_out',lambda layer,w,b,R:b.lat_s.ol[:R].clone())
++    monkeypatch.setattr(forward,'cp_scratch',lambda *a:sc)
++    monkeypatch.setattr(forward,'mm',lambda *a:None)
++    monkeypatch.setattr(latent,'latent_write',lambda *a,**kw:None)
++    monkeypatch.setattr(dsa_full,'k_rope_write',lambda *a,**kw:None)
++    monkeypatch.setattr(dsa_full,'q_rope',lambda q,qp,*a:qp)
++    monkeypatch.setattr(dsa_full,'index_write',lambda *a,**kw:None)
++    monkeypatch.setattr(dsa_full,'index_q_rope',lambda *a:None)
++    monkeypatch.setattr(latent,'absorb_q',lambda q,a,out,**kw:out.copy_(q))
++    def select(qi,wts,keys,rank,G,pos,n,*,out,**kw):
++        out.fill_(n)
++        return out
++    seen=[]
++    def merge(cands,rank,G,k):
++        seen.append(cands.clone())
++        return torch.zeros(cands.shape[1],k,dtype=torch.int32),torch.ones(cands.shape[1],dtype=torch.int32)
++    monkeypatch.setattr(dcp,'select_local',select)
++    monkeypatch.setattr(dcp,'select_merge',merge)
++    def partial(qa,qp,lc,kr,tokens,counts,scale,*,o,lse,parts):
++        o.copy_(qa+lc[0,0]);lse.zero_()
++        return o,lse
++    monkeypatch.setattr(dcp,'attention_partial',partial)
++    monkeypatch.setattr(dcp,'merge_ranks',lambda got,lse,out:out.copy_(got.mean(0)))
++    result=cp_batch.mix(verify,NS(index=0,dsa=a))
++    expected=b.q+15
++    expected[:2]+=3
++    expected[2:]+=7
++    assert torch.equal(result,expected)
++    assert [x[0] for x in calls] == ['gather','gather','exchange']
++    assert [tuple(x.shape) for x in seen] == [(4,2,2),(4,3,2)]
++    for n,cands in zip((2,3),seen):
++        for g in range(G):
++            assert torch.equal(cands[g],torch.full((n,K),n+10*g))
+-- 
+2.43.0
+

@@ -1,0 +1,65 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/cp_merge.py b/src/tensorfold/families/glm5_next/cuda/cp_merge.py
+new file mode 100644
+index 00000000..801ef461
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/cp_merge.py
+@@ -0,0 +1,45 @@
++"""CP candidate merge: one resident candidate vector, identical integer radix order."""
++import os
++import triton
++import triton.language as tl
++
++ENABLED = os.environ.get('TF_GLM_CP_VECTOR_MERGE', '0') == '1'
++
++
++@triton.jit
++def _merge(C, SL, CNT, R, RANK: tl.constexpr, G: tl.constexpr, K: tl.constexpr,
++           KP: tl.constexpr, ALL: tl.constexpr):
++    r = tl.program_id(0).to(tl.int64)
++    i = tl.arange(0, ALL)
++    g, j = i // KP, i % KP
++    valid = (g < G) & (j < K)
++    u = tl.load(C + (g.to(tl.int64) * R + r) * K + j, valid, other=0).to(tl.uint64, bitcast=True)
++    bins = tl.arange(0, 256)
++    prefix = tl.full((), 0, tl.uint64)
++    fixed = tl.full((), 0, tl.uint64)
++    need = K
++    for p in range(8):
++        match = valid & ((u & fixed) == prefix)
++        hist = tl.histogram(((u >> (56 - 8 * p)) & 255).to(tl.int32), 256, mask=match)
++        above = tl.sum(hist, 0) - tl.cumsum(hist, 0)
++        digit = tl.max(tl.where(above + hist >= need, bins, 0), 0)
++        need -= tl.sum(tl.where(bins > digit, hist, 0), 0)
++        prefix |= digit.to(tl.uint64) << (56 - 8 * p)
++        fixed |= tl.full((), 255, tl.uint64) << (56 - 8 * p)
++    own_j = tl.arange(0, KP)
++    own = tl.load(C + (RANK * R + r) * K + own_j, own_j < K, other=0).to(tl.uint64, bitcast=True)
++    keep = (own_j < K) & (own != 0) & (own >= prefix)
++    count = tl.sum(keep.to(tl.int32), 0)
++    at = tl.cumsum(keep.to(tl.int32), 0) - 1
++    global_pos = 4294967295 - own.to(tl.uint32).to(tl.int64)
++    tl.store(SL + r * K + at, (global_pos // G).to(tl.int32), keep)
++    tl.store(SL + r * K + own_j, 0, (own_j < K) & (own_j >= count))
++    tl.store(CNT + r, count)
++
++
++def merge(candidates, slots, counts, rank, world, k):
++    rows = candidates.shape[1]
++    kp = triton.next_power_of_2(k)
++    _merge[(rows,)](candidates, slots, counts, rows, RANK=rank, G=world, K=k,
++                    KP=kp, ALL=triton.next_power_of_2(world) * kp, num_warps=8)
++    return slots, counts
+diff --git a/src/tensorfold/families/glm5_next/cuda/dcp.py b/src/tensorfold/families/glm5_next/cuda/dcp.py
+index 10f366ba..858636a0 100644
+--- a/src/tensorfold/families/glm5_next/cuda/dcp.py
++++ b/src/tensorfold/families/glm5_next/cuda/dcp.py
+@@ -258,6 +258,9 @@ def select_merge(cands: torch.Tensor, rank: int, G: int, k: int = TOPK, *, slots
+     dev = cands.device
+     slots = torch.empty((R, k), dtype=torch.int32, device=dev) if slots is None else slots
+     counts = torch.empty((R,), dtype=torch.int32, device=dev) if counts is None else counts
++    from . import cp_merge
++    if cp_merge.ENABLED and 0 < R <= 16 and G == 4 and k == 2048:
++        return cp_merge.merge(cands, slots, counts, int(rank), G, k)
+     if R:
+         _merge_select[(R,)](cands, slots, counts, R, int(rank), G=int(G), K=k, KP=triton.next_power_of_2(k),
+                             num_warps=8 if k > 1024 else 4)

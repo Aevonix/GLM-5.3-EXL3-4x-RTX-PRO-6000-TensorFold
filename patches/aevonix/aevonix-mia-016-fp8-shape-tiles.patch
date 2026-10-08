@@ -1,0 +1,37 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/qmm.py b/src/tensorfold/families/glm5_next/cuda/qmm.py
+index 51ea5a01..cffedde5 100644
+--- a/src/tensorfold/families/glm5_next/cuda/qmm.py
++++ b/src/tensorfold/families/glm5_next/cuda/qmm.py
+@@ -506,6 +506,10 @@ def _matmul_f8(x: torch.Tensor, q: F8, *, out: torch.Tensor | None, f32: bool,
+     sk = b16_split_k(q.n, q.k)
+     seq = _seq(sk, m, q.n, q.k)
+     bn = F8_BN_DECODE if bm == 16 else F8_BN
++    if bm == 16:
++        override = f8_tile(q.n, q.k)
++        if override is not None:
++            bn, warps, stages = override
+     cfg = _prompt_cfg(sk, m, q.n, q.k)
+     if cfg is not None:
+         bm, bn, warps, stages, seq = cfg
+@@ -618,3 +622,21 @@ def fp8_weights(base):
+             return n + n // F8_BLOCK * 4, extra
+         return total, extra
+     return transform
++
++
++_f8_env = ("", {})
++def f8_tile(n: int, k: int):
++    import os
++    global _f8_env
++    value = os.environ.get("TF_GLM_F8_SHAPE_TILES", "")
++    if value != _f8_env[0]:
++        parsed = {}
++        for item in value.split(",") if value else ():
++            shape, config = item.split(":")
++            key = tuple(map(int, shape.split("x"))) if shape != "all" else "all"
++            bn, warps, stages = map(int, config.split("x"))
++            if (key != "all" and (len(key) != 2 or min(key) <= 0)) or bn not in (16, 32, 64, 128) or warps not in (4, 8) or stages not in (2, 3, 4, 6):
++                raise ValueError("TF_GLM_F8_SHAPE_TILES: NxK|all:BNxwarpsxstages")
++            parsed[key] = (bn, warps, stages)
++        _f8_env = value, parsed
++    return _f8_env[1].get((n, k), _f8_env[1].get("all"))

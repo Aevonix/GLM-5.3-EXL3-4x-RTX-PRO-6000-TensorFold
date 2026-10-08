@@ -1,0 +1,26 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi.py b/src/tensorfold/families/glm5_next/cuda/multi.py
+index c59aef53..93511ed5 100644
+--- a/src/tensorfold/families/glm5_next/cuda/multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/multi.py
+@@ -1029,6 +1029,11 @@ class MultiDecoder:
+             snap.drafter_end = n
+             snap.drafter_rows = draft_window(self._ctx(lane), n)
+         snap.head = head
++        self._retain(lane, snap)
++
++    def _retain(self, lane, snap):
++        """Attach a newly captured or restored snapshot to its owned extent."""
++        n = len(snap.ids)
+         # rank 0's key: a text prompt's is its ids (shared, not a second list); rank 1 keeps none
+         snap.key = None if lane.key is None else snap.ids if not lane.images else lane.key[:n]
+         snap.images = lane.images
+@@ -1095,7 +1100,8 @@ class MultiDecoder:
+                                disk_cached=n, disk_load_s=round(time.perf_counter() - started, 3))
+         lane.st.set_pos(n)
+         lane.s.cached = n
+-        lane.head = snap.head if n == len(lane.s.prompt) else None
++        lane.head = snap.head.clone() if n == len(lane.s.prompt) else None
++        self._retain(lane, snap)
+         lane.point = grid_point(len(lane.s.prompt), n, self.grid)
+         lane.shared = [p for p in lane.shared if n < p]
+         lane.stops = list(lane.shared) + ([lane.point] if lane.point is not None

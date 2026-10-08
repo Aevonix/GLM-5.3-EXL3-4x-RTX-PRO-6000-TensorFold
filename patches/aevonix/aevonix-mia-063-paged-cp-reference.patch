@@ -1,0 +1,289 @@
+diff --git a/src/tensorfold/cuda/geometry.py b/src/tensorfold/cuda/geometry.py
+index 65bfcd09..3dc4d672 100644
+--- a/src/tensorfold/cuda/geometry.py
++++ b/src/tensorfold/cuda/geometry.py
+@@ -493,7 +493,13 @@ def mla_full_geometry(t: dict, world: int, reserve: int, *, share, decode_rows:
+     ``cp_kv_gather`` (TF_GLM_CP_KV_GATHER): a prompt chunk's buffers are the larger of the two paths'
+     (``full_cp_kvg_bytes``)."""
+ 
++    import os
++
+     fixed = full_cp_absorb_bytes(t, cp, world, mtp=mtp) if cp > 1 and cp_raw_q else 0
++    # Up to three simultaneously retained staging sets (prompt/solo/batched decode),
++    # each at most one model-limit layer. Includes table/index temporaries.
++    if os.environ.get("TF_GLM_CP_PAGED", "0") == "1":
++        fixed += 1 << 30
+ 
+     def bytes_at(capacity: int) -> int:
+         b = full_buffer_bytes(t, decode_rows, world=world, share=share, capacity=capacity, prefill=False,
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index bbdb2f79..3dfa2701 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -981,6 +981,7 @@ class GlmEngine:
+         disk_on = int(bool(os.environ.get("TF_GLM_DISK_CACHE", "").strip() not in ("", "0", "off")) and parallel == 1)
+         mine.append(disk_on)
+         mine.append(self.cp_pool_tokens)
++        mine.append(int(os.environ.get("TF_GLM_CP_PAGED", "0")))
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = 0 if self.cp_pool_tokens else int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+diff --git a/src/tensorfold/families/glm5_next/cuda/forward.py b/src/tensorfold/families/glm5_next/cuda/forward.py
+index 7ccfa549..c5a61ca3 100644
+--- a/src/tensorfold/families/glm5_next/cuda/forward.py
++++ b/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -297,7 +297,14 @@ class Caches:
+                 ring_rows = int(streams) * self.ring
+                 self.rings = [tuple(torch.zeros((ring_rows, c.index_dim), dtype=torch.bfloat16, device=dev)
+                                     for _ in range(2)) for _ in range(n_idx)]
+-        self.arena = Arena(rows, planes)
++        from .paged_cp import PagedArena, enabled as paged_on
++
++        if paged_on():
++            if cp != 4 or streams < 2 or w.mtp is not None:
++                raise ValueError("paged CP reference requires CP4, multiple streams and no MTP")
++            self.arena = PagedArena(rows, planes)
++        else:
++            self.arena = Arena(rows, planes)
+         self.rows = rows
+ 
+     def index_tensors(self, i: int) -> tuple:
+@@ -943,7 +950,13 @@ def dsa_full_out(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor
+ PROMPT_SPARSE_ROWS = 512   # full GLM-5.3: a prompt chunk's rows a sparse attention call takes (~185 MiB of partials)
+ 
+ 
+-def dsa_full_cp(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
++def dsa_full_cp(layer, w, lc, kr, pos_dev, b, R, keys, host_pos, sparse_np, **kwargs):
++    from .paged_cp import run
++
++    return run(_dsa_full_cp, layer, w, lc, kr, pos_dev, b, R, keys, host_pos, sparse_np, **kwargs)
++
++
++def _dsa_full_cp(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
+                 R: int, keys: torch.Tensor | None, host_pos: int | None, sparse_np: int | None, *, lo: int = 0, rows_only: bool = False):
+     """dsa_full_block under context parallelism (TF_GLM_CP; ``dcp``, work/DCP-DESIGN.md): the rank's caches hold the
+     positions p with p % cp == rank (rows p // cp); every row takes the selection path (a row that sees k tokens or
+@@ -1406,6 +1419,7 @@ def cp_kvg_buffers(b: Buffers, lc: torch.Tensor, kr: torch.Tensor, G: int, S: in
+     if held is None or held[0].shape[0] < rows or held[0].dtype != lc.dtype or held[1].dtype != kr.dtype \
+             or held[0].shape[1:] != lc.shape[1:] or held[1].shape[1:] != kr.shape[1:]:
+         b.cp_kvg = None
++        held = None  # do not hold the old pair while allocating a larger pair
+         held = b.cp_kvg = (torch.empty((rows, *lc.shape[1:]), dtype=lc.dtype, device=lc.device),
+                            torch.empty((rows, *kr.shape[1:]), dtype=kr.dtype, device=kr.device))
+     return held[0][:G * S], held[1][:G * S]
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi.py b/src/tensorfold/families/glm5_next/cuda/multi.py
+index 42d68cd9..138da63f 100644
+--- a/src/tensorfold/families/glm5_next/cuda/multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/multi.py
+@@ -1062,7 +1062,8 @@ class MultiDecoder:
+ 
+         used = self._used(x)
+         old = self.pool.move(x, base, size)
+-        self.arena.copy(old, base, used)
++        relocate = getattr(self.arena, "move", self.arena.copy)
++        relocate(old, base, used)
+         if x.owner is not None:
+             self.lanes[x.owner].st.bind(x.base, x.size)
+ 
+diff --git a/src/tensorfold/families/glm5_next/cuda/paged_copy.py b/src/tensorfold/families/glm5_next/cuda/paged_copy.py
+new file mode 100644
+index 00000000..f6439095
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/paged_copy.py
+@@ -0,0 +1,38 @@
++"""Bit-preserving physical-page copies without intermediate index tensors."""
++import torch
++import triton as tr
++import triton.language as tl
++
++
++@tr.jit
++def _copy(SRC, DST, TABLE, BASE, START,
++          COUNT, WIDTH: tl.constexpr, PAGE_ROWS: tl.constexpr,
++          WRITE: tl.constexpr, BLOCK: tl.constexpr):
++    x = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    row = x // WIDTH
++    local = BASE + START + row
++    physical = tl.load(TABLE + local // PAGE_ROWS, row < COUNT, other=0) * PAGE_ROWS + local % PAGE_ROWS
++    mapped = physical * WIDTH + x % WIDTH
++    source = x if WRITE else mapped
++    target = mapped if WRITE else x
++    value = tl.load(SRC + source, x < COUNT * WIDTH, other=0)
++    tl.store(DST + target, value, x < COUNT * WIDTH)
++
++
++def copy(view, count, start, value=None, *, write=False):
++    """Copy raw bytes, including every quantizer scale and the masked pad row."""
++    if not 0 <= start <= start + count <= view.shape[0]:
++        raise ValueError('paged copy outside extent')
++    plane = view.arena.planes[view.plane]
++    if value is None:
++        value = torch.empty((count, *view.shape[1:]), dtype=view.dtype, device=view.device)
++    if count == 0:
++        return value
++    if not value.is_contiguous() or not view.tensor.is_contiguous():
++        raise ValueError('paged byte-copy expects contiguous rows')
++    width = view.tensor[0].numel() * view.tensor.element_size()
++    source, target = (value, view.tensor) if write else (view.tensor, value)
++    _copy[(tr.cdiv(count * width, 1024),)](
++        source.view(torch.uint8), target.view(torch.uint8), view.arena.table,
++        view.base // plane.div, start, count, width, 2048 // plane.div, write, 1024)
++    return value
+diff --git a/src/tensorfold/families/glm5_next/cuda/paged_cp.py b/src/tensorfold/families/glm5_next/cuda/paged_cp.py
+new file mode 100644
+index 00000000..aacaedf4
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/paged_cp.py
+@@ -0,0 +1,152 @@
++"""Exact paged-CP reference using one layer's bounded contiguous staging.
++
++Logical extents retain the scheduler's lifecycle; physical pages are independently
++addressed through a shared table. Kernels operate on a gathered per-layer view,
++then only newly written local rows scatter back. This avoids changing attention
++math and is deliberately a performance reference, not a claim of zero-cost paging.
++"""
++import os
++import torch
++from .pool import Arena, ALIGN
++
++
++def enabled():
++    return os.environ.get('TF_GLM_CP_PAGED', '0') == '1'
++
++
++class PagedView:
++    def __init__(self, arena, plane, base, size):
++        self.arena, self.plane = arena, plane
++        self.base, self.size = int(base), int(size)
++        self.tensor = arena.planes[plane].tensor
++        p = arena.planes[plane]
++        self.shape = torch.Size((size // p.div + p.pad, *self.tensor.shape[1:]))
++        self.dtype, self.device = self.tensor.dtype, self.tensor.device
++
++    def indices(self, start, count):
++        p = self.arena.planes[self.plane]
++        local = torch.arange(self.base // p.div + start, self.base // p.div + start + count,
++                             device=self.device, dtype=torch.int64)
++        page_rows = ALIGN // p.div
++        page = local // page_rows
++        return self.arena.table[page] * page_rows + local % page_rows
++
++    def gather(self, count=None, start=0, out=None):
++        count = self.shape[0] - start if count is None else count
++        if self.device.type == 'cuda' and os.environ.get('TF_GLM_CP_PAGED_KERNELS', '0') == '1':
++            from .paged_copy import copy
++            return copy(self, count, start, out)
++        return torch.index_select(self.tensor, 0, self.indices(start, count), out=out)
++
++    def write(self, start, value):
++        if not 0 <= start <= start + value.shape[0] <= self.shape[0]:
++            raise ValueError('paged write outside extent')
++        if self.device.type == 'cuda' and os.environ.get('TF_GLM_CP_PAGED_KERNELS', '0') == '1':
++            from .paged_copy import copy
++            copy(self, value.shape[0], start, value, write=True)
++            return
++        self.tensor.index_copy_(0, self.indices(start, value.shape[0]), value)
++
++    def clone(self):
++        return self.gather()
++
++    def __getitem__(self, key):
++        # Diagnostic/snapshot reads; live multi-stream snapshots retain extents,
++        # never materialize all target layers. Disk restore is refused in this mode.
++        if isinstance(key, slice) and key.step in (None, 1):
++            a, z, _ = key.indices(self.shape[0])
++            return self.gather(z-a, a)
++        return self.gather()[key]
++
++
++class PagedArena(Arena):
++    def __init__(self, rows, planes):
++        super().__init__(rows, planes)
++        if rows % ALIGN or any(ALIGN % p.div for p in planes):
++            raise ValueError('paged CP requires whole rank-aligned pages')
++        pages = rows // ALIGN
++        # Nonidentity mapping exercises every reader/writer, including extent moves.
++        # The final sentinel maps the arena's one masked pad row to its own storage.
++        self.host_table = list(reversed(range(pages))) + [pages]
++        self.table = torch.tensor(self.host_table, dtype=torch.int64, device=planes[0].tensor.device)
++
++    def view(self, i, base, size):
++        if base < 0 or base + size > self.rows:
++            raise ValueError('paged extent outside arena')
++        return PagedView(self, i, base, size)
++
++    def move(self, src, dst, n):
++        """Relocate ownership without copying KV; source-only pages become free.
++
++        The caller moves one extent into otherwise free space (possibly overlapping
++        itself). Swapping the displaced pages into the vacated logical addresses
++        preserves a bijection. A prefix branch uses copy(), retaining its source.
++        """
++        if n <= 0 or src == dst:
++            return
++        if min(src, dst) < 0 or max(src, dst) + n > self.rows or src % ALIGN or dst % ALIGN:
++            raise ValueError('invalid paged extent move')
++        count = -(-n // ALIGN)
++        a, b = src // ALIGN, dst // ALIGN
++        source, target = set(range(a, a+count)), set(range(b, b+count))
++        old = self.host_table
++        new = old.copy()
++        new[b:b+count] = old[a:a+count]
++        for vacated, displaced in zip(sorted(source-target), sorted(target-source)):
++            new[vacated] = old[displaced]
++        # All ranks apply the same host permutation; default-stream ordering keeps
++        # old attention reads before this update and the next gather after it.
++        self.table.copy_(torch.tensor(new, dtype=self.table.dtype, device=self.table.device))
++        self.host_table = new
++
++    def copy(self, src, dst, n):
++        if n <= 0 or src == dst:
++            return
++        if min(src, dst) < 0 or max(src, dst) + n > self.rows or src % ALIGN or dst % ALIGN:
++            raise ValueError('invalid paged extent copy')
++        # Bounded, overlap-safe copies for relocation and kept-prefix branching.
++        step = min(ALIGN, abs(dst-src))
++        starts = range(0,n,step) if dst < src else reversed(range(0,n,step))
++        for at in starts:
++            count=min(step,n-at)
++            for i,p in enumerate(self.planes):
++                nr=-(-count//p.div)
++                source=self.view(i,src+at,count)
++                target=self.view(i,dst+at,count)
++                target.write(0,source.gather(nr))
++
++
++def run(fn, layer, w, lc, kr, pos_dev, b, R, keys, host_pos, sparse_np, **kwargs):
++    if not isinstance(lc, PagedView):
++        return fn(layer,w,lc,kr,pos_dev,b,R,keys,host_pos,sparse_np,**kwargs)
++    if host_pos is None or sparse_np is not None:
++        raise ValueError('paged CP reference requires eager windows and a host position')
++    G,rank=int(w.meta['cp']),int(w.rank)
++    # All ranks stage identical shapes, including ranks with one fewer valid row.
++    count=min(lc.shape[0],-(-(host_pos+R)//G)+1)
++    held=getattr(b,'paged_buffers',None)
++    if held is None:
++        held=b.paged_buffers={}
++    views=[lc,kr,keys]
++    flat=[]
++    for name,v in zip(('latent','rope','index'),views):
++        if v is None:
++            flat.append(None);continue
++        # Match the admitted extent, not the growing prefix. Returning its full
++        # shape also lets the unchanged CP KV-gather scratch allocate once.
++        cap=v.shape[0]
++        buf=held.get(name)
++        if buf is None or buf.shape[0]<cap or buf.dtype!=v.dtype:
++            held.pop(name, None)
++            buf = None  # release the old allocation before requesting its replacement
++            held[name]=buf=torch.empty((cap,*v.shape[1:]),dtype=v.dtype,device=v.device)
++        v.gather(count,out=buf[:count])
++        flat.append(buf[:cap])
++    result=fn(layer,w,*flat[:2],pos_dev,b,R,flat[2],host_pos,sparse_np,**kwargs)
++    lo=max(0,(host_pos+G-1-rank)//G)
++    hi=max(0,(host_pos+R+G-1-rank)//G)
++    if hi>lo:
++        for view,value in zip(views,flat):
++            if view is not None:
++                view.write(lo,value[lo:hi])
++    return result

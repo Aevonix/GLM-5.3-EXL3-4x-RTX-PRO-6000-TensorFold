@@ -1,0 +1,85 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/dspark.py b/src/tensorfold/families/glm5_next/cuda/dspark.py
+index 208f29ea..a153fff3 100644
+--- a/src/tensorfold/families/glm5_next/cuda/dspark.py
++++ b/src/tensorfold/families/glm5_next/cuda/dspark.py
+@@ -322,7 +322,9 @@ class Drafter(_DFlash2):
+         m0, self.inter = sh["mlp"]
+         self.eps = c.eps
+         self.mask_id = c.mask_id
+-        self.block = int(block or c.block)
++        self.block = int(block or __import__("os").environ.get("TF_GLM_DSPARK_BLOCK", "") or c.block)
++        if self.block < 1:
++            raise ValueError("DSpark block must be positive")
+         if self.block > c.block:
+             raise ValueError(f"block {self.block} past the trained {c.block}")
+         self.top_k = int(top_k)
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 8130d61f..af481fe5 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -1352,7 +1352,14 @@ class GlmEngine:
+         from .decode import DepthPolicy
+ 
+         if self.drafter is not None and type(self.drafter).__module__.endswith(".dspark") and self.costs is not None:
+-            p = DepthPolicy(min(8, MAX_ROWS - 1), fixed=True, round_ms=round_costs(self.costs))
++            most = int(os.environ.get("TF_GLM_DSPARK_MOST", "8"))
++            if not 1 <= most <= 8:
++                raise ValueError("TF_GLM_DSPARK_MOST must be 1..8")
++            mode = os.environ.get("TF_GLM_DSPARK_POLICY", "cost")
++            if mode not in ("cost", "fixed"):
++                raise ValueError("TF_GLM_DSPARK_POLICY must be cost or fixed")
++            p = DepthPolicy(min(most, self.drafter.block, MAX_ROWS - 1), fixed=True,
++                            round_ms=round_costs(self.costs) if mode == "cost" else None)
+             p.learned = True
+             return p
+         return DepthPolicy(5, fixed=True, confidence=0.3)
+@@ -1622,6 +1629,11 @@ class GlmEngine:
+             return stats
+         self.e.vote = on_tokens                     # on every rank alike: each verify gather carries one word more
+         policy = decode_policy(code, self.costs)
++        # EXL3 auto resolves to the explicit f-policy before reaching this point.
++        # Keep the default unless the solo DSpark tuning controls are requested.
++        if (use_dflash and not auto and type(drafter).__module__.endswith(".dspark")
++                and any(k in os.environ for k in ("TF_GLM_DSPARK_MOST", "TF_GLM_DSPARK_POLICY"))):
++            policy = self._f_policy()
+         copies = None
+         if policy is not None and self.copy is not None:     # prompt and pending token, alike on both ranks
+             # TF_GLM_COPY_HYBRID: only dflash_decode with a DSpark drafter vets copies (``decode.hybrid_round``)
+diff --git a/tests/test_glm_dspark_tuning.py b/tests/test_glm_dspark_tuning.py
+new file mode 100644
+index 00000000..f5316504
+--- /dev/null
++++ b/tests/test_glm_dspark_tuning.py
+@@ -0,0 +1,32 @@
++"""Draft controls select calibrated costs and stay scoped to DSpark."""
++from types import SimpleNamespace
++import pytest
++from tensorfold.families.glm5_next.cuda.engine import GlmEngine
++
++def engine(block=8):
++    drafter=type('StubDrafter',(),{'__module__':'tensorfold.families.glm5_next.cuda.dspark'})()
++    drafter.block=block
++    return SimpleNamespace(drafter=drafter,costs={'verify':(20.,24.,27.,30.,33.,36.,39.,42.,45.),'block':1.,'taps_row':.25})
++
++@pytest.mark.parametrize('mode',['cost','fixed'])
++@pytest.mark.parametrize('block,most,expected',[(8,8,8),(4,8,4),(8,3,3)])
++def test_controls_bound_depth_and_enable_cost_selection(monkeypatch,mode,block,most,expected):
++    monkeypatch.setenv('TF_GLM_DSPARK_MOST',str(most));monkeypatch.setenv('TF_GLM_DSPARK_POLICY',mode)
++    policy=GlmEngine._f_policy(engine(block))
++    assert policy.most==expected and policy.fixed and policy.learned
++    if mode=='cost':
++        assert policy.round_ms==(21.25,25.25,28.25,31.25,34.25,37.25,40.25,43.25,46.25)
++        assert policy.chain_rule['round_ms']==policy.round_ms
++    else:assert policy.round_ms is None and policy.chain_rule=={}
++
++@pytest.mark.parametrize('name,value',[('TF_GLM_DSPARK_MOST','0'),('TF_GLM_DSPARK_MOST','9'),('TF_GLM_DSPARK_POLICY','unknown')])
++def test_invalid_controls_are_rejected(monkeypatch,name,value):
++    monkeypatch.delenv('TF_GLM_DSPARK_MOST',raising=False);monkeypatch.delenv('TF_GLM_DSPARK_POLICY',raising=False)
++    monkeypatch.setenv(name,value)
++    with pytest.raises(ValueError):GlmEngine._f_policy(engine())
++
++def test_other_drafters_keep_their_default_policy(monkeypatch):
++    monkeypatch.setenv('TF_GLM_DSPARK_MOST','0')
++    value=engine();value.drafter=SimpleNamespace(block=8)
++    policy=GlmEngine._f_policy(value)
++    assert policy.most==5 and policy.confidence==.3 and policy.round_ms is None and not policy.learned

@@ -1,0 +1,26 @@
+[
+  {
+    "path": "build/aevonix-mia-001-package-cuda-headers.patch",
+    "sha256": "713ad48811ad224672f5bdbd4cebeddb6b5d9c4a9dba414719260b2fa439f780",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "build/aevonix-mia-002-single-host-pcie-launch.patch",
+    "sha256": "88c607a22fcbc98f45d4606d4826b7856544c36f8a8e20aac20030b7abdacec8",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "build/aevonix-mia-127-build-context.patch",
+    "sha256": "ee2c545f616306c95b83dd3997aa28f1bde312997de45bb216d26ecc24449348",
+    "strip": 1,
+    "cwd": "."
+  },
+  {
+    "path": "build/aevonix-mia-135-recipe-runtime-pins.patch",
+    "sha256": "c56c4206ec30ca41e113bb8a7815cf7ba7c8d12413ce144e0886d960ce537335",
+    "strip": 1,
+    "cwd": "."
+  }
+]

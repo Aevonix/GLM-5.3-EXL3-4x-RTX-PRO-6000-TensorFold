@@ -1,0 +1,65 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 5d289992..95496cd7 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -355,6 +355,15 @@ def round_costs(costs: dict) -> tuple[float, ...]:
+ PARALLEL_MOST = 4                     # --parallel: concurrent requests at most (the segmented kernels' streams)
+ 
+ 
++def parallel_limit(*, full: bool, cp: int) -> int:
++    """Five streams are supported by full-model CP4's per-stream attention path.
++
++    Its scheduler still caps the total verification window at sixteen rows;
++    five streams receive at most three rows each. Other paths retain their limit.
++    """
++    return 5 if full and cp == 4 and os.environ.get("TF_GLM_CP_MULTI", "0") == "1" else PARALLEL_MOST
++
++
+ def multi_drafts(multi) -> str:
+     """--parallel's startup line: how the streams draft."""
+ 
+@@ -715,20 +724,23 @@ class GlmEngine:
+ 
+         if world not in SIZES:
+             raise ValueError(f"GLM-5.3-Flash's CUDA engine runs on {', '.join(map(str, SIZES))} ranks, not {world}")
++        parallel_most = PARALLEL_MOST
+         if int(parallel) > 1:
+             # before any connection or memory (``parallel_refusal``)
+             early = Config.read(model_dir)
++            early_cp = world if early.full and os.environ.get("TF_GLM_CP", "0").strip() == "1" else 1
++            parallel_most = parallel_limit(full=bool(early.full), cp=early_cp)
+             why = parallel_refusal(int(parallel), full=bool(early.full), drafter=drafter is not None,
+                                    dspark=is_dspark(drafter), serial_only=serial_only,
+-                                   cp=world if early.full and os.environ.get("TF_GLM_CP", "0").strip() == "1" else 1)
++                                   cp=early_cp)
+             if why:
+                 raise ValueError(why)
+         torch.cuda.set_device(0)
+         self.torch = torch
+         self.rank, self.world = rank, world
+         parallel = int(parallel)
+-        if not 1 <= parallel <= PARALLEL_MOST:
+-            raise ValueError(f"--parallel: 1 to {PARALLEL_MOST} requests at once, not {parallel}")
++        if not 1 <= parallel <= parallel_most:
++            raise ValueError(f"--parallel: 1 to {parallel_most} requests at once, not {parallel}")
+         self.parallel = parallel
+         self.policy = "0" if serial_only else policy
+         self.serial_only = serial_only
+diff --git a/tests/test_cp_five_streams.py b/tests/test_cp_five_streams.py
+new file mode 100644
+index 00000000..cd232d6c
+--- /dev/null
++++ b/tests/test_cp_five_streams.py
+@@ -0,0 +1,12 @@
++import pytest
++
++from tensorfold.families.glm5_next.cuda.engine import parallel_limit
++
++
++@pytest.mark.parametrize('full,cp,enabled,expected', [
++    (True,4,'1',5), (True,4,'0',4), (True,1,'1',4),
++    (True,2,'1',4), (True,3,'1',4), (False,4,'1',4),
++])
++def test_five_stream_admission_is_limited_to_opted_in_full_cp4(monkeypatch,full,cp,enabled,expected):
++    monkeypatch.setenv('TF_GLM_CP_MULTI',enabled)
++    assert parallel_limit(full=full,cp=cp)==expected

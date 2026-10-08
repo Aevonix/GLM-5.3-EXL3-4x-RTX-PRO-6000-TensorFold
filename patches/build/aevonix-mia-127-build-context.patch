@@ -1,0 +1,8 @@
+diff --git a/.dockerignore b/.dockerignore
+new file mode 100644
+--- /dev/null
++++ b/.dockerignore
+@@ -0,0 +1,3 @@
++TensorFold/.git
++TensorFold/**/__pycache__
++TensorFold/.pytest_cache

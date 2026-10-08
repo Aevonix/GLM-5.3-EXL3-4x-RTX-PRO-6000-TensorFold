@@ -1,0 +1,23 @@
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -1,5 +1,20 @@
+ FROM nvcr.io/nvidia/pytorch:26.07-py3
+ COPY TensorFold /opt/TensorFold
+ RUN pip install --no-cache-dir /opt/TensorFold 'av==18.1.0' 'xgrammar>=0.2.8,<0.3' 'jsonschema>=4.18'
++RUN python - <<'PYHEADERS'
++from pathlib import Path
++import shutil, hashlib, tensorfold
++src = Path('/opt/TensorFold/src/tensorfold')
++dst = Path(tensorfold.__file__).parent
++headers = [p for p in src.rglob('*') if p.suffix in ('.h', '.hpp', '.cuh')]
++assert headers and (src / 'cuda/exl3/experts_grouped.cuh').is_file()
++for p in headers:
++    target = dst / p.relative_to(src)
++    target.parent.mkdir(parents=True, exist_ok=True)
++    shutil.copy2(p, target)
++    assert hashlib.sha256(p.read_bytes()).digest() == hashlib.sha256(target.read_bytes()).digest()
++print(f'Runtime headers verified: {len(headers)}')
++PYHEADERS
++RUN python -c 'import tensorfold.cuda.server, tensorfold.cuda.roce, tensorfold.families.glm5_next.cuda.engine'
+ ENV TORCH_CUDA_ARCH_LIST=12.0 TORCH_EXTENSIONS_DIR=/cache/torch_extensions TRITON_CACHE_DIR=/cache/triton MAX_JOBS=4
+ WORKDIR /workspace

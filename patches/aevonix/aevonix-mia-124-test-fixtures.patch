@@ -1,0 +1,51 @@
+diff --git a/tests/test_anthropic_api.py b/tests/test_anthropic_api.py
+index 7ce241d..7ab613f 100644
+--- a/tests/test_anthropic_api.py
++++ b/tests/test_anthropic_api.py
+@@ -19,7 +19,7 @@ BASE = {"model": "local-model", "max_tokens": 128, "messages": [{"role": "user",
+ def serving(backend, tmp_path, *, fail=False):
+     if backend == "cuda":
+         app = app_for(tmp_path, Engine())
+-        app.aliases = (*app.aliases, "local-model")
++        app.aliases = (*getattr(app, "aliases", ()),  "local-model")
+         with http_server(app) as port:
+             yield app, port
+     else:
+diff --git a/tests/test_api_keys_http.py b/tests/test_api_keys_http.py
+index 7ecc09e..8ea2c6c 100644
+--- a/tests/test_api_keys_http.py
++++ b/tests/test_api_keys_http.py
+@@ -175,7 +175,7 @@ def test_authenticated_replies_and_translated_handlers_count_once(backend, path,
+ 
+     app = FakeApp() if backend == "mlx" else app_for(tmp_path, PacedEngine())
+     if backend == "cuda":
+-        app.aliases = (*app.aliases, "fixture")
++        app.aliases = (*getattr(app, "aliases", ()),  "fixture")
+     app.auth = KeyStore(["fixture-key"])
+     httpd = Server(("127.0.0.1", 0), (mlx_handler if backend == "mlx" else cuda_handler)(app))
+     thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+diff --git a/tests/test_auxiliary_http_framing.py b/tests/test_auxiliary_http_framing.py
+index 7addf08..4c9be4d 100644
+--- a/tests/test_auxiliary_http_framing.py
++++ b/tests/test_auxiliary_http_framing.py
+@@ -26,7 +26,7 @@ ROUTES = [
+ def auxiliary_port(request, tmp_path):
+     app = cuda_app(tmp_path) if request.param == "cuda" else MacApp()
+     if request.param == "cuda":
+-        app.aliases = (*app.aliases, "local-model")
++        app.aliases = (*getattr(app, "aliases", ()),  "local-model")
+     app.reasoning_effort = None
+     handler = (cuda_handler if request.param == "cuda" else mac_handler)(app)
+     handler.log_message = lambda *args: None
+diff --git a/tests/test_glm_score_cache.py b/tests/test_glm_score_cache.py
+index 00c567a..202df0d 100644
+--- a/tests/test_glm_score_cache.py
++++ b/tests/test_glm_score_cache.py
+@@ -45,6 +45,7 @@ def _engine(monkeypatch, cells, logits):
+     engine.comm = None
+     engine.rank = 0
+     engine.limit = 1000
++    engine.grid = 0
+     engine._share = lambda values: list(values)
+     return engine
+ 

@@ -1,0 +1,135 @@
+{
+  "model": "GLM-5.3 EXL3",
+  "system": [
+    {
+      "label": "MODEL",
+      "value": "GLM-5.3 EXL3"
+    },
+    {
+      "label": "ENGINE",
+      "value": "TensorFold v0.6.6 + 151 patches"
+    },
+    {
+      "label": "PATCHES",
+      "value": "106 Mia's AI Lab"
+    },
+    {
+      "label": "PATCHES",
+      "value": "45 Aevonix Research"
+    },
+    {
+      "label": "GPUs",
+      "value": "4x RTX PRO 6000"
+    },
+    {
+      "label": "MEMORY",
+      "value": "96 GB each"
+    },
+    {
+      "label": "FABRIC",
+      "value": "One PCIe host with CUDA peer access"
+    },
+    {
+      "label": "BENCH",
+      "value": "TensorFold v0.6.5 · 250 W per GPU"
+    },
+    {
+      "label": "CONTEXT",
+      "value": "1,048,576 tokens/request"
+    },
+    {
+      "label": "SERVING",
+      "value": "Up to 5 concurrent"
+    },
+    {
+      "label": "FORMATS",
+      "value": "fp8 dense · fp8 KV"
+    },
+    {
+      "label": "DRAFTER",
+      "value": "dspark"
+    },
+    {
+      "label": "QUANT",
+      "value": "Mia's AI Lab · EXL3 · 2.75-bit"
+    }
+  ],
+  "chart": [
+    {
+      "label": "prose ×1",
+      "value": 91.66,
+      "tone": 0
+    },
+    {
+      "label": "prose ×2",
+      "value": 100.71,
+      "tone": 0
+    },
+    {
+      "label": "prose ×4",
+      "value": 132.87,
+      "tone": 0
+    },
+    {
+      "label": "prose ×5",
+      "value": 139.52,
+      "tone": 0
+    },
+    {
+      "label": "code ×1",
+      "value": 130.26,
+      "tone": 1
+    },
+    {
+      "label": "code ×2",
+      "value": 166.47,
+      "tone": 1
+    },
+    {
+      "label": "code ×4",
+      "value": 149.65,
+      "tone": 1
+    },
+    {
+      "label": "code ×5",
+      "value": 150.59,
+      "tone": 1
+    },
+    {
+      "label": "struc ×1",
+      "value": 156.99,
+      "tone": 2
+    },
+    {
+      "label": "struc ×2",
+      "value": 212.75,
+      "tone": 2
+    },
+    {
+      "label": "struc ×4",
+      "value": 210.3,
+      "tone": 2
+    },
+    {
+      "label": "struc ×5",
+      "value": 194.51,
+      "tone": 2
+    }
+  ],
+  "chart_title": "sparkDash · greedy · 250 W",
+  "corner": "151 patches · 250 W",
+  "opener": "GLM-5.3 EXL3 // 4x RTX PRO 6000 // TensorFold v0.6.6",
+  "credit": "TensorFold by Ash Hart · In collaboration with Mia's AI Lab",
+  "start_sequence": [
+    "check host",
+    "build pinned engine",
+    "download pinned checkpoint",
+    "start four ranks",
+    "wait for API",
+    "smoke test"
+  ],
+  "endpoint": "API :8030 · glm-5.3",
+  "title_model": "GLM-5.3",
+  "title_subtitle": "FULL MODEL | 4x RTX PRO 6000 | TensorFold | 1M context",
+  "title_placement": "after-logo"
+}

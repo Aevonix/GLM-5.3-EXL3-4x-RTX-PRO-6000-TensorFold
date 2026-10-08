@@ -1,0 +1,106 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/app.py b/src/tensorfold/families/glm5_next/cuda/app.py
+index 487eb5f..bbd4b54 100644
+--- a/src/tensorfold/families/glm5_next/cuda/app.py
++++ b/src/tensorfold/families/glm5_next/cuda/app.py
+@@ -8,7 +8,7 @@ from typing import Any, Callable
+ 
+ from tensorfold.cuda.server import App, PreparedRequest, RequestError
+ from tensorfold.families.glm5_next.cuda.kept_reasoning import KeptReasoning
+-from tensorfold.families.glm5_next.prompts import agent_history, thinking_off
++from tensorfold.families.glm5_next.prompts import agent_history, clear_thinking as read_clear_thinking, thinking_off
+ from tensorfold.server.errors import CONTEXT_LIMIT
+ 
+ 
+@@ -18,11 +18,13 @@ class ThinkingOffTemplate:
+     (``prompts.agent_history``), with the reasoning of tool-calling steps the client dropped put back (``kept``,
+     ``kept_reasoning.KeptReasoning``; None: off)."""
+ 
+-    def __init__(self, inner, kept: KeptReasoning | None = None, clear_thinking: bool = False) -> None:
++    def __init__(self, inner, kept: KeptReasoning | None = None, clear: bool | None = None,
++                 *, clear_thinking: bool | None = None) -> None:
+         self.inner = inner
+         self.efforts = getattr(inner, "efforts", frozenset())
+         self.kept = kept
+-        self.clear_thinking = clear_thinking
++        chosen = clear if clear is not None else clear_thinking
++        self.clear_thinking = read_clear_thinking() if chosen is None else chosen
+ 
+     def render(self, messages, *, tools, enable_thinking, extra=None, allow_images: bool = False) -> str:
+         if self.kept is not None:
+diff --git a/tests/test_anthropic_api.py b/tests/test_anthropic_api.py
+index 5d77cee..7ce241d 100644
+--- a/tests/test_anthropic_api.py
++++ b/tests/test_anthropic_api.py
+@@ -19,6 +19,7 @@ BASE = {"model": "local-model", "max_tokens": 128, "messages": [{"role": "user",
+ def serving(backend, tmp_path, *, fail=False):
+     if backend == "cuda":
+         app = app_for(tmp_path, Engine())
++        app.aliases = (*app.aliases, "local-model")
+         with http_server(app) as port:
+             yield app, port
+     else:
+diff --git a/tests/test_api_keys_http.py b/tests/test_api_keys_http.py
+index 3a628f9..7ecc09e 100644
+--- a/tests/test_api_keys_http.py
++++ b/tests/test_api_keys_http.py
+@@ -174,6 +174,8 @@ def test_authenticated_replies_and_translated_handlers_count_once(backend, path,
+     from tests.test_cuda_server_disconnect import PacedEngine, app_for
+ 
+     app = FakeApp() if backend == "mlx" else app_for(tmp_path, PacedEngine())
++    if backend == "cuda":
++        app.aliases = (*app.aliases, "fixture")
+     app.auth = KeyStore(["fixture-key"])
+     httpd = Server(("127.0.0.1", 0), (mlx_handler if backend == "mlx" else cuda_handler)(app))
+     thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+diff --git a/tests/test_auxiliary_http_framing.py b/tests/test_auxiliary_http_framing.py
+index 7529f8b..7addf08 100644
+--- a/tests/test_auxiliary_http_framing.py
++++ b/tests/test_auxiliary_http_framing.py
+@@ -25,6 +25,8 @@ ROUTES = [
+ @pytest.fixture(params=["cuda", "mac"])
+ def auxiliary_port(request, tmp_path):
+     app = cuda_app(tmp_path) if request.param == "cuda" else MacApp()
++    if request.param == "cuda":
++        app.aliases = (*app.aliases, "local-model")
+     app.reasoning_effort = None
+     handler = (cuda_handler if request.param == "cuda" else mac_handler)(app)
+     handler.log_message = lambda *args: None
+diff --git a/tests/test_glm_cuda_kept.py b/tests/test_glm_cuda_kept.py
+index b6c752a..aea9053 100644
+--- a/tests/test_glm_cuda_kept.py
++++ b/tests/test_glm_cuda_kept.py
+@@ -23,11 +23,11 @@ def kept(monkeypatch):
+     """An engine with only its kept-conversation state; save_rows records the saved bytes of every snapshot."""
+     made, peaks = [], []
+ 
+-    def save_rows(e, snap):
++    def save_rows(e, snap, drafter=None):
+         snap.rows, snap.nbytes = object(), snap.need
+         peaks.append(sum(s.nbytes for s in made if s.rows is not None) + sum(s.states for s in made if s in e.cache))
+ 
+-    decode = SimpleNamespace(row_bytes=lambda e, s: s.need, save_rows=save_rows,
++    decode = SimpleNamespace(row_bytes=lambda e, s, drafter=None: s.need, save_rows=save_rows,
+                              snapshot_bytes=lambda s: s.states + (s.nbytes if s.rows is not None else 0))
+     monkeypatch.setitem(sys.modules, "tensorfold.families.glm5_next.cuda.decode", decode)
+     engine = GlmEngine.__new__(GlmEngine)
+diff --git a/tests/test_glm_score_cache.py b/tests/test_glm_score_cache.py
+index 0788d5f..00c567a 100644
+--- a/tests/test_glm_score_cache.py
++++ b/tests/test_glm_score_cache.py
+@@ -26,14 +26,14 @@ class _Snap:
+ 
+ 
+ def _engine(monkeypatch, cells, logits):
+-    def save_rows(e, snap):
++    def save_rows(e, snap, drafter=None):
+         snap.rows, snap.nbytes, snap.drafter_end = list(cells), snap.need, -1
+ 
+     def prompt_logits(e, prompt):
+         cells[:] = ["decision", *prompt]
+         return logits
+ 
+-    decode = SimpleNamespace(row_bytes=lambda e, s: s.need, save_rows=save_rows,
++    decode = SimpleNamespace(row_bytes=lambda e, s, drafter=None: s.need, save_rows=save_rows,
+                              snapshot_bytes=lambda s: s.states + (s.nbytes if s.rows is not None else 0))
+     monkeypatch.setitem(sys.modules, "tensorfold.families.glm5_next.cuda.decode", decode)
+     monkeypatch.setitem(sys.modules, "tensorfold.families.glm5_next.cuda.score",

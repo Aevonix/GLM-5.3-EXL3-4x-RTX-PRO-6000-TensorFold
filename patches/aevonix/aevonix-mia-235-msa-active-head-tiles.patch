@@ -1,0 +1,120 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/msa.cu b/src/tensorfold/families/glm5_next/cuda/msa.cu
+index 15eec528..59d061aa 100644
+--- a/src/tensorfold/families/glm5_next/cuda/msa.cu
++++ b/src/tensorfold/families/glm5_next/cuda/msa.cu
+@@ -142,7 +142,7 @@ __device__ __forceinline__ uint32_t e2m1x2_scaled_bf16x2(uint32_t by, __nv_bfloa
+     return *reinterpret_cast<const uint32_t*>(&p);
+ }
+ 
+-template <bool FP4, bool R8, bool LUT = false>
++template <bool FP4, bool R8, bool LUT = false, int HEAD_TILES = 2>
+ __global__ void __launch_bounds__(NTHREADS, 1) msa_kernel(
+     const __nv_bfloat16* __restrict__ qa, const __nv_bfloat16* __restrict__ qp, const uint8_t* __restrict__ cache,
+     const unsigned char* __restrict__ rope, const int* __restrict__ tokens, const int* __restrict__ counts,
+@@ -194,9 +194,10 @@ __global__ void __launch_bounds__(NTHREADS, 1) msa_kernel(
+     const int qm = warp & 1, np = (warp >> 1) & 1, kh = warp >> 2;
+     float* X = reinterpret_cast<float*>(smem + SM_X) + ((size_t)(qm * 2 + np) * 32 + lane) * 16;
+     // the PV warp: output columns 64 warp ..
+-    float o[2][8][4];
++    // Omit only output head tiles whose rows the caller never reads.
++    float o[HEAD_TILES][8][4];
+ #pragma unroll
+-    for (int a = 0; a < 2; ++a)
++    for (int a = 0; a < HEAD_TILES; ++a)
+ #pragma unroll
+         for (int b = 0; b < 8; ++b)
+ #pragma unroll
+@@ -405,14 +406,14 @@ __global__ void __launch_bounds__(NTHREADS, 1) msa_kernel(
+         }
+         // O = O * alpha + P^T V: warp's 64 columns (8 n tiles), both head m tiles, the tile's 2 k steps of 16 keys
+         {
+-            float al[2][2];
++            float al[HEAD_TILES][2];
+ #pragma unroll
+-            for (int a = 0; a < 2; ++a) {
++            for (int a = 0; a < HEAD_TILES; ++a) {
+                 al[a][0] = ast[a * 16 + g];
+                 al[a][1] = ast[a * 16 + g + 8];
+             }
+ #pragma unroll
+-            for (int a = 0; a < 2; ++a)
++            for (int a = 0; a < HEAD_TILES; ++a)
+ #pragma unroll
+                 for (int b = 0; b < 8; ++b) {
+                     o[a][b][0] *= al[a][0];
+@@ -422,9 +423,9 @@ __global__ void __launch_bounds__(NTHREADS, 1) msa_kernel(
+                 }
+ #pragma unroll
+             for (int kk = 0; kk < KT / 16; ++kk) {
+-                uint32_t pa[2][4];
++                uint32_t pa[HEAD_TILES][4];
+ #pragma unroll
+-                for (int a = 0; a < 2; ++a)
++                for (int a = 0; a < HEAD_TILES; ++a)
+                     ldsm_x4(pa[a], P + (size_t)(a * 16 + (lane & 15)) * PS + kk * 16 + (lane >> 4) * 8);
+ #pragma unroll
+                 for (int b = 0; b < 8; ++b) {
+@@ -432,7 +433,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) msa_kernel(
+                     uint32_t vb[2];
+                     ldsm_x2_t(vb, K + (size_t)(kk * 16 + (lane & 15)) * KS + warp * 64 + b * 8);
+ #pragma unroll
+-                    for (int a = 0; a < 2; ++a) mma_bf16(o[a][b], pa[a], vb);
++                    for (int a = 0; a < HEAD_TILES; ++a) mma_bf16(o[a][b], pa[a], vb);
+                 }
+             }
+         }
+@@ -442,7 +443,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) msa_kernel(
+     if (lse != nullptr && threadIdx.x < H) lse[(size_t)r * H + threadIdx.x] = mst[threadIdx.x] + logf(lst[threadIdx.x]);
+     // out = O / l, bf16 (heads < H)
+ #pragma unroll
+-    for (int a = 0; a < 2; ++a) {
++    for (int a = 0; a < HEAD_TILES; ++a) {
+         const int ha = a * 16 + g, hb = ha + 8;
+         const float la = ha < 32 ? lst[ha] : 1.f, lb = hb < 32 ? lst[hb] : 1.f;
+ #pragma unroll
+@@ -474,6 +475,10 @@ void msa_prompt_cuda(const at::Tensor& qa, const at::Tensor& qp, const at::Tenso
+                 "msa: a 512-wide FP8 latent cache with 64 rotary values");
+     TORCH_CHECK(!r8 || fp4, "msa: e4m3 rotary keys (TF_GLM_KV=fp4x) go with an FP4 latent cache");
+     static bool once = [] {
++#ifdef MSA_HALF_HEADS
++        C10_CUDA_CHECK(cudaFuncSetAttribute(msa_kernel<false, false, false, 1>,
++                                            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM));
++#endif
+         C10_CUDA_CHECK(cudaFuncSetAttribute(msa_kernel<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                             (int)SMEM));
+         C10_CUDA_CHECK(cudaFuncSetAttribute(msa_kernel<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+@@ -488,9 +493,14 @@ void msa_prompt_cuda(const at::Tensor& qa, const at::Tensor& qp, const at::Tenso
+     }();
+     (void)once;
+     if (R == 0) return;
+-    (r8 ? (g_fp4_lut ? msa_kernel<true, true, true> : msa_kernel<true, true>)
+-        : fp4 ? (g_fp4_lut ? msa_kernel<true, false, true> : msa_kernel<true, false>) : msa_kernel<false, false>)
+-        <<<R, NTHREADS, SMEM, at::cuda::getCurrentCUDAStream()>>>(
++    auto kernel = r8 ? (g_fp4_lut ? msa_kernel<true, true, true> : msa_kernel<true, true>)
++        : fp4 ? (g_fp4_lut ? msa_kernel<true, false, true> : msa_kernel<true, false>) : msa_kernel<false, false>;
++#ifdef MSA_HALF_HEADS
++    // TP4 uses at most 16 local heads. Preserve the QK and softmax schedule;
++    // only the unused second PV head tile is removed. FP4 keeps its path.
++    if (!fp4 && H <= 16) kernel = msa_kernel<false, false, false, 1>;
++#endif
++    kernel<<<R, NTHREADS, SMEM, at::cuda::getCurrentCUDAStream()>>>(
+         reinterpret_cast<const __nv_bfloat16*>(qa.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(qp.data_ptr()),
+         cache.data_ptr<uint8_t>(), reinterpret_cast<const unsigned char*>(rope.data_ptr()), tokens.data_ptr<int>(),
+         counts.data_ptr<int>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), lse, H, (int)tokens.size(1),
+diff --git a/src/tensorfold/families/glm5_next/cuda/msa.py b/src/tensorfold/families/glm5_next/cuda/msa.py
+index 41613aa1..5ce701f2 100644
+--- a/src/tensorfold/families/glm5_next/cuda/msa.py
++++ b/src/tensorfold/families/glm5_next/cuda/msa.py
+@@ -27,8 +27,10 @@ def _ext():
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    ext = load(name="tensorfold_glm_msa_v7", sources=[str(here / "msa.cpp"), str(here / "msa.cu")],
+-               extra_cuda_cflags=["-O3", "-lineinfo"], verbose=False)
++    half_heads = __import__("os").environ.get("TF_GLM_MSA_HALF_HEADS", "0") == "1"
++    flags = ["-DMSA_HALF_HEADS"] if half_heads else []
++    ext = load(name="tensorfold_glm_msa_headtiles" + ("_half" if half_heads else "_reference"), sources=[str(here / "msa.cpp"), str(here / "msa.cu")],
++               extra_cuda_cflags=["-O3", "-lineinfo"] + flags, verbose=False)
+     ext.set_fp4_lut(FP4_LUT)
+     return ext
+ 

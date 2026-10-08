@@ -1,0 +1,55 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/cp_merge.py b/src/tensorfold/families/glm5_next/cuda/cp_merge.py
+index 801ef461..f4a9ebf3 100644
+--- a/src/tensorfold/families/glm5_next/cuda/cp_merge.py
++++ b/src/tensorfold/families/glm5_next/cuda/cp_merge.py
+@@ -4,11 +4,12 @@ import triton
+ import triton.language as tl
+ 
+ ENABLED = os.environ.get('TF_GLM_CP_VECTOR_MERGE', '0') == '1'
++EARLY_EXIT = os.environ.get('TF_GLM_CP_MERGE_EARLY_EXIT', '0') == '1'
+ 
+ 
+ @triton.jit
+ def _merge(C, SL, CNT, R, RANK: tl.constexpr, G: tl.constexpr, K: tl.constexpr,
+-           KP: tl.constexpr, ALL: tl.constexpr):
++           KP: tl.constexpr, ALL: tl.constexpr, EARLY: tl.constexpr = False):
+     r = tl.program_id(0).to(tl.int64)
+     i = tl.arange(0, ALL)
+     g, j = i // KP, i % KP
+@@ -18,7 +19,9 @@ def _merge(C, SL, CNT, R, RANK: tl.constexpr, G: tl.constexpr, K: tl.constexpr,
+     prefix = tl.full((), 0, tl.uint64)
+     fixed = tl.full((), 0, tl.uint64)
+     need = K
+-    for p in range(8):
++    p = 0
++    done = tl.full((), False, tl.int1)
++    while (p < 8) & ~done:
+         match = valid & ((u & fixed) == prefix)
+         hist = tl.histogram(((u >> (56 - 8 * p)) & 255).to(tl.int32), 256, mask=match)
+         above = tl.sum(hist, 0) - tl.cumsum(hist, 0)
+@@ -26,6 +29,18 @@ def _merge(C, SL, CNT, R, RANK: tl.constexpr, G: tl.constexpr, K: tl.constexpr,
+         need -= tl.sum(tl.where(bins > digit, hist, 0), 0)
+         prefix |= digit.to(tl.uint64) << (56 - 8 * p)
+         fixed |= tl.full((), 255, tl.uint64) << (56 - 8 * p)
++        if EARLY:
++            # The remaining order statistic is an exact extremum when the
++            # target is first or last within the selected radix bin.
++            size = tl.sum(tl.where(bins == digit, hist, 0), 0)
++            if (need == 1) | (need == size):
++                selected = valid & ((u & fixed) == prefix)
++                if need == 1:
++                    prefix = tl.max(tl.where(selected, u, tl.full((), 0, tl.uint64)), 0)
++                else:
++                    prefix = tl.min(tl.where(selected, u, tl.full((), 0xffffffffffffffff, tl.uint64)), 0)
++                done = tl.full((), True, tl.int1)
++        p += 1
+     own_j = tl.arange(0, KP)
+     own = tl.load(C + (RANK * R + r) * K + own_j, own_j < K, other=0).to(tl.uint64, bitcast=True)
+     keep = (own_j < K) & (own != 0) & (own >= prefix)
+@@ -41,5 +56,5 @@ def merge(candidates, slots, counts, rank, world, k):
+     rows = candidates.shape[1]
+     kp = triton.next_power_of_2(k)
+     _merge[(rows,)](candidates, slots, counts, rows, RANK=rank, G=world, K=k,
+-                    KP=kp, ALL=triton.next_power_of_2(world) * kp, num_warps=8)
++                    KP=kp, ALL=triton.next_power_of_2(world) * kp, EARLY=EARLY_EXIT, num_warps=8)
+     return slots, counts

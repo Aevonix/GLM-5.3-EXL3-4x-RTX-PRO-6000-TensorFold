@@ -1,0 +1,70 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 49ca7f0..8130d61 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -995,13 +995,18 @@ class GlmEngine:
+             raise ValueError(("TF_GLM_MTP=0 leaves" if cfg.mtp_layers else "this checkpoint has") + " no MTP head and "
+                              "no DFlash2 draft model was given, so every round would decode one token: pull the draft "
+                              "model on both machines (--drafter), or pass --no-drafts to both for the serial reference")
+-        if self.split.split and self.split.exchange == "p2p" and getattr(self.comm, "world", 2) == 2 \
+-                and hasattr(self.comm, "exchange"):
+-            # both ranks: open the split's send/receive connection before the weights and the cache pool take the
++        if self.split.split and self.split.exchange == "p2p" and hasattr(self.comm, "exchange" if world == 2
++                                                                         else "exchange_all"):
++            # every rank: open the split's send/receive connections before the weights and the cache pool take the
+             # memory; opened at the split's warm-up (after the pool), NCCL's buffer registration could fail with
+-            # ENOMEM (ibv_reg_mr, issue #36). The connection stays open; nothing it sends changes
++            # ENOMEM (ibv_reg_mr, issue #36). The connections stay open; nothing they send changes. Past two ranks,
++            # one to every peer, as ``hcsplit.RowSplit.warm`` opens them
+             a = torch.zeros((1,), dtype=torch.float32, device="cuda")
+-            self.comm.exchange([a], [torch.empty_like(a)], 1 - rank)
++            if world == 2:
++                self.comm.exchange([a], [torch.empty_like(a)], 1 - rank)
++            else:
++                peers = [p for p in range(world) if p != rank]
++                self.comm.exchange_all({p: [a] for p in peers}, {p: [torch.empty_like(a)] for p in peers})
+             torch.cuda.synchronize()
+         w = load(model_dir, rank=rank, world=world, mtp=self.mtp_on)
+         w.comm = self.comm
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi.py b/src/tensorfold/families/glm5_next/cuda/multi.py
+index 38cbdfb..ea44150 100644
+--- a/src/tensorfold/families/glm5_next/cuda/multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/multi.py
+@@ -128,18 +128,19 @@ def digest(msg: Sequence[int], seq: int) -> int:
+     return int((int((a * w % SEAL_MOD).sum()) + seq * 1_000_003) % SEAL_MOD)
+ 
+ 
+-def unseal(msg: Sequence[int], seq: int) -> list[int]:
+-    """Rank 1: the message rank 0 sealed as number ``seq``, or a RuntimeError naming what differs: the ranks would
+-    otherwise apply different ops and wait on each other's collectives forever (issue #29's hangs had no error)."""
++def unseal(msg: Sequence[int], seq: int, rank: int = 1) -> list[int]:
++    """A follower (rank ``rank``, 1 or more): the message rank 0 sealed as number ``seq``, or a RuntimeError naming
++    what differs: the ranks would otherwise apply different ops and wait on each other's collectives forever (issue
++    #29's hangs had no error)."""
+ 
+     if len(msg) < 2:
+-        raise RuntimeError(f"rank 1: message {seq} from rank 0 is {len(msg)} values long, too short to be sealed; "
+-                           "the ranks are out of step: restart both")
++        raise RuntimeError(f"rank {rank}: message {seq} from rank 0 is {len(msg)} values long, too short to be sealed; "
++                           "the ranks are out of step: restart them all")
+     body, got_seq, got = list(msg[:-2]), int(msg[-2]), int(msg[-1])
+     if got_seq != seq or got != digest(body, got_seq):
+-        raise RuntimeError(f"rank 1: expected rank 0's message {seq}, received number {got_seq} "
++        raise RuntimeError(f"rank {rank}: expected rank 0's message {seq}, received number {got_seq} "
+                            f"({'checksum matches' if got == digest(body, got_seq) else 'checksum differs'}, "
+-                           f"{len(body)} values): the ranks are out of step: restart both")
++                           f"{len(body)} values): the ranks are out of step: restart them all")
+     return body
+ 
+ 
+@@ -1752,8 +1753,8 @@ class MultiDecoder:
+             if self.idle:
+                 self.g._await_bell()
+                 self.idle = False
+-            _watch(self.watchdog, "rank 1 message")       # busy: rank 0's next message is due within a round
+-            self.apply(unseal(self.g._share(None), self.received))
++            _watch(self.watchdog, f"rank {self.rank} message")       # busy: rank 0's next message is due within a round
++            self.apply(unseal(self.g._share(None), self.received, self.rank))
+             self.received = (self.received + 1) % SEAL_MOD
+             _unwatch(self.watchdog)
+             if once:

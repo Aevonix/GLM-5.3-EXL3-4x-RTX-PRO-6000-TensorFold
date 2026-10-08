@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Copy to scripts/local.sh. Exported environment values take precedence.
+# Defaults are in scripts/config.sh; the measured serving profile is profiles/production.env.
+# Any profile key set here overrides the measured value and makes a different, unmeasured profile.
+PORT=8030
+HOST=0.0.0.0
+# Store downloaded weights, compiled kernels and parked prompts outside the checkout:
+# DATA_DIR=/mnt/models/glm53-full
+# Bind the API to this host only:
+# HOST=127.0.0.1
+# A single-session allocation (measured separately; see docs/NOTES.md):
+# PARALLEL=1
+# HF_TOKEN may be exported for downloads; never commit it.

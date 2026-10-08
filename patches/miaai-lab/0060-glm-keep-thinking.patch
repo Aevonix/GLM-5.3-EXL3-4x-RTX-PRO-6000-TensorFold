@@ -1,0 +1,55 @@
+0060-glm-keep-thinking.patch: port to TensorFold v0.6.5.
+Original author credited in the source recipe. See PORT-TABLE.md.
+
+diff --git tensorfold/families/glm5_next/cuda/app.py tensorfold/families/glm5_next/cuda/app.py
+index ede1818..487eb5f 100644
+--- tensorfold/families/glm5_next/cuda/app.py
++++ tensorfold/families/glm5_next/cuda/app.py
+@@ -2,12 +2,13 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ from pathlib import Path
+ from typing import Any, Callable
+ 
+ from tensorfold.cuda.server import App, PreparedRequest, RequestError
+ from tensorfold.families.glm5_next.cuda.kept_reasoning import KeptReasoning
+-from tensorfold.families.glm5_next.prompts import agent_history, clear_thinking, thinking_off
++from tensorfold.families.glm5_next.prompts import agent_history, thinking_off
+ from tensorfold.server.errors import CONTEXT_LIMIT
+ 
+ 
+@@ -17,16 +18,17 @@ class ThinkingOffTemplate:
+     (``prompts.agent_history``), with the reasoning of tool-calling steps the client dropped put back (``kept``,
+     ``kept_reasoning.KeptReasoning``; None: off)."""
+ 
+-    def __init__(self, inner, kept: KeptReasoning | None = None, clear: bool | None = None) -> None:
++    def __init__(self, inner, kept: KeptReasoning | None = None, clear_thinking: bool = False) -> None:
+         self.inner = inner
+         self.efforts = getattr(inner, "efforts", frozenset())
+         self.kept = kept
+-        self.clear = clear_thinking() if clear is None else clear
++        self.clear_thinking = clear_thinking
+ 
+     def render(self, messages, *, tools, enable_thinking, extra=None, allow_images: bool = False) -> str:
+-        extra = {"clear_thinking": self.clear, **(extra or {})}
+         if self.kept is not None:
+             messages = self.kept.restore(messages)
++        # earlier turns keep their reasoning unless the request says otherwise, as in zai-org's current template
++        extra = {"clear_thinking": self.clear_thinking, **(extra or {})}
+         text = self.inner.render(agent_history(messages), tools=tools, enable_thinking=enable_thinking, extra=extra,
+                                  allow_images=allow_images)
+         return text if enable_thinking else thinking_off(text)
+@@ -62,7 +64,10 @@ class GlmApp(App):
+         super().__init__(engine, model_dir, served, **kwargs)
+         if self.vision is not None:
+             media_template(self.template, Path(model_dir))
+-        self.template = ThinkingOffTemplate(self.template, KeptReasoning.from_env())
++        clear = os.environ.get("TF_GLM_CLEAR_THINKING", "0").strip() or "0"
++        if clear not in ("0", "1"):
++            raise ValueError(f"TF_GLM_CLEAR_THINKING={clear!r}: expected 0 or 1")
++        self.template = ThinkingOffTemplate(self.template, KeptReasoning.from_env(), clear_thinking=clear == "1")
+ 
+     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
+         """Validate the rendered prompt plus max_tokens against the engine context limit before streaming."""

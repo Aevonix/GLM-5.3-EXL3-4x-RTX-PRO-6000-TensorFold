@@ -1,0 +1,58 @@
+diff --git a/src/tensorfold/cuda/comm.py b/src/tensorfold/cuda/comm.py
+index 236ee7d..9e26289 100644
+--- a/src/tensorfold/cuda/comm.py
++++ b/src/tensorfold/cuda/comm.py
+@@ -129,14 +129,15 @@ class NCCL:
+         if len(sends) != len(recvs) or peer == self.rank or not 0 <= peer < self.world:
+             raise ValueError("exchange: one receive per send, from another rank")
+         for s, r in zip(sends, recvs):
+-            if s.numel() != r.numel() or s.dtype != r.dtype or not (s.is_contiguous() and r.is_contiguous()):
+-                raise ValueError("exchange: each send and receive must be contiguous and alike in size and dtype")
++            if not (s.is_contiguous() and r.is_contiguous()):
++                raise ValueError("exchange: send and receive must be contiguous")
+         stream = torch.cuda.current_stream().cuda_stream
+         self._check(self.lib.ncclGroupStart())
+         try:
+             for s, r in zip(sends, recvs):
+                 if s.numel():
+                     self._check(self.lib.ncclSend(s.data_ptr(), s.numel(), _DTYPES[s.dtype], peer, self.comm, stream))
++                if r.numel():
+                     self._check(self.lib.ncclRecv(r.data_ptr(), r.numel(), _DTYPES[r.dtype], peer, self.comm, stream))
+         finally:
+             self._check(self.lib.ncclGroupEnd())
+@@ -228,7 +229,13 @@ class Transport:
+         return getattr(self.base, name)
+ 
+ 
+-BACKENDS: dict[str, Callable[[Comm], Comm]] = {}
++def _roce(base: Comm) -> Comm:
++    from tensorfold.cuda.roce import RoceComm
++
++    return RoceComm(base, base.rank, base.world)
++
++
++BACKENDS: dict[str, Callable[[Comm], Comm]] = {"roce": _roce}
+ 
+ 
+ def register_backend(name: str, wrap: Callable[[Comm], Comm]) -> None:
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index cafc2f4..d906367 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -686,13 +686,10 @@ class GlmEngine:
+         self.parallel = parallel
+         self.policy = "0" if serial_only else policy
+         self.serial_only = serial_only
+-        self.comm = comm if comm is not None else open_comm(rank, world, master, port)
++        backend = os.environ.get("TF_GLM_COMM") or os.environ.get("TF_COMM_BACKEND", "nccl")
++        self.comm = comm if comm is not None else open_comm(rank, world, master, port, backend=backend)
+         self.comm.barrier()
+-        if comm is None and os.environ.get("TF_GLM_COMM", "nccl") == "roce":
+-            # small all-gathers (a decode round's partials, the samplers) over b12x's one-shot RoCE transport
+-            from tensorfold.cuda.roce import RoceComm
+-
+-            self.comm = RoceComm(self.comm, rank, world)
++        if comm is None and backend == "roce":
+             if rank == 0:
+                 roce = self.comm.roce
+                 routes = getattr(roce, "routes", None)

@@ -1,0 +1,14 @@
+**
+!scripts/
+!scripts/apply-patches.sh
+!patches/
+!patches/*.json
+!patches/miaai-lab/
+!patches/miaai-lab/*.patch
+!patches/aevonix/
+!patches/aevonix/*.patch
+!patches/build/
+!patches/build/*.patch
+!build/
+!build/recipe-base/
+!build/recipe-base/Dockerfile

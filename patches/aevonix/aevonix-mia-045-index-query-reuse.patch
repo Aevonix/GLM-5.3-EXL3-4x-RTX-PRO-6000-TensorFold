@@ -1,0 +1,88 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/dcp.py b/src/tensorfold/families/glm5_next/cuda/dcp.py
+index 46106027..6dec6c86 100644
+--- a/src/tensorfold/families/glm5_next/cuda/dcp.py
++++ b/src/tensorfold/families/glm5_next/cuda/dcp.py
+@@ -159,6 +159,9 @@ def score_local(qi: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, rank: i
+     if qi.shape[1] != H * D or not qi.is_contiguous() or wts.stride(1) != 1 \
+             or keys.dtype not in (torch.bfloat16, torch.uint8) or not keys.is_contiguous() or out.stride(1) != 1:
+         raise ValueError("dcp scores: contiguous index queries [R, H * D], unit-stride weights, contiguous bf16 keys")
++    from . import mia_index
++    if mia_index.applies(R, NT):
++        return mia_index.score(qi, wts, keys, pos_dev, R, NT, out, rank, G)
+     KEYS, KS, K8 = key_args(keys)
+     if R:
+         ng = min(ROW_G, triton.cdiv(NT, BT))
+diff --git a/src/tensorfold/families/glm5_next/cuda/dsa_full.py b/src/tensorfold/families/glm5_next/cuda/dsa_full.py
+index 7bf65503..7041ea06 100644
+--- a/src/tensorfold/families/glm5_next/cuda/dsa_full.py
++++ b/src/tensorfold/families/glm5_next/cuda/dsa_full.py
+@@ -376,6 +376,9 @@ def score(qi: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, pos_dev: torc
+             or keys.dtype not in (torch.bfloat16, torch.uint8) or not keys.is_contiguous():
+         raise ValueError("index scores: contiguous index queries [R, H * D], unit-stride weights, bf16 (or fp4x) keys")
+     KEYS, KS, K8 = key_args(keys)
++    from . import mia_index
++    if rows_per_program == 1 and mia_index.applies(R, NT):
++        return mia_index.score(qi, wts, keys, pos_dev, R, NT, out)
+     rb = int(rows_per_program)
+     g = min(ROW_G, triton.cdiv(NT, BT)) if rb == 1 else 1
+     grid = (triton.cdiv(R, rb), g if rb == 1 else triton.cdiv(NT, BT))
+diff --git a/src/tensorfold/families/glm5_next/cuda/mia_index.py b/src/tensorfold/families/glm5_next/cuda/mia_index.py
+new file mode 100644
+index 00000000..44abf36e
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/mia_index.py
+@@ -0,0 +1,54 @@
++"""Reuse one 64-token key tile across query rows, keeping each row's dot and head sum unchanged."""
++import os
++import triton
++import triton.language as tl
++from .dsa_full import key_tile, key_args, _wscale
++
++ROWS = int(os.environ.get("TF_MIA_INDEX_ROWS", "1"))
++if ROWS not in (1, 2, 4, 8):
++    raise ValueError("TF_MIA_INDEX_ROWS: 1, 2, 4 or 8")
++
++def applies(R, NT):
++    return ROWS > 1 and R >= ROWS and NT >= 32768
++
++@triton.jit
++def _scores_grouped(QI, W, w_stride, KEYS, OUT, o_stride, POS, R, NT, scale, wscale, RANK: tl.constexpr, WORLD: tl.constexpr, H: tl.constexpr,
++                   HP: tl.constexpr, D: tl.constexpr, BTT: tl.constexpr, RB: tl.constexpr, KS=None,
++                   K8: tl.constexpr = 0):
++    """_scores for prompt rows, program (RB rows, one token block): the same per-row tile and masks."""
++    rb = tl.program_id(0)
++    tb = tl.program_id(1)
++    P = tl.load(POS)
++    d = tl.arange(0, D)
++    hh = tl.arange(0, HP)
++    hok = hh < H
++    last = tl.minimum((P + tl.minimum((rb + 1) * RB, R) + WORLD - 1 - RANK) // WORLD, NT)
++    t = tb * BTT + tl.arange(0, BTT)
++    if tb * BTT >= last:
++        for i in tl.static_range(RB):
++            r = rb * RB + i
++            if r < R:
++                tl.store(OUT + r * o_stride + t, float("-inf"), mask=t < NT)
++        return
++    k = key_tile(KEYS, KS, t, t < last, d, D, K8)
++    for i in tl.static_range(RB):
++        r = rb * RB + i
++        if r < R:
++            n = (P + r + WORLD - RANK) // WORLD
++            q = tl.load(QI + (r * H + hh[:, None]) * D + d[None, :], mask=hok[:, None], other=0.0).to(tl.bfloat16)
++            kr = tl.where((t < n)[:, None], k, 0.0)
++            dots = tl.dot(q, tl.trans(kr))
++            w = tl.load(W + r * w_stride + hh, mask=hok, other=0.0).to(tl.float32) * wscale
++            sc = tl.sum(w[:, None] * tl.maximum(dots * scale, 0.0), axis=0)
++            tl.store(OUT + r * o_stride + t, tl.where(t < n, sc, float("-inf")), mask=t < NT)
++
++
++def score(qi, wts, keys, pos, R, NT, out, rank=0, world=1):
++    KEYS, KS, K8 = key_args(keys)
++    H = wts.shape[1]
++    D = keys.shape[1] - 4 if K8 else keys.shape[1]
++    _scores_grouped[(triton.cdiv(R, ROWS), triton.cdiv(NT, 64))](
++        qi, wts, wts.stride(0), KEYS, out, out.stride(0), pos, R, NT, D**-.5, _wscale(H),
++        RANK=rank, WORLD=world, H=H, HP=max(16,triton.next_power_of_2(H)), D=D, BTT=64,
++        RB=ROWS, KS=KS, K8=K8, num_warps=4)
++    return out

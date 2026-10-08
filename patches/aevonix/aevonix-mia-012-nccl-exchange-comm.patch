@@ -1,0 +1,258 @@
+diff --git a/src/tensorfold/cuda/comm.py b/src/tensorfold/cuda/comm.py
+index 9e26289b..e51704e7 100644
+--- a/src/tensorfold/cuda/comm.py
++++ b/src/tensorfold/cuda/comm.py
+@@ -51,6 +51,68 @@ def _library() -> ctypes.CDLL:
+     raise RuntimeError("libnccl not found (set TF_NCCL_LIB)")
+ 
+ 
++def _loaded_path(name: str = "libnccl.so") -> str | None:
++    """The file of the loaded library named ``name``* (libnccl.so, libnccl.so.2, ...; not NCCL's plugins such as
++    libnccl-net-*.so) in this process's memory map, or None."""
++
++    try:
++        with open("/proc/self/maps") as f:
++            for line in f:
++                path = line.split()[-1] if line.strip() else ""
++                if os.path.basename(path).startswith(name):
++                    return path
++    except OSError:
++        pass
++    return None
++
++
++def _second_library(lib: ctypes.CDLL) -> ctypes.CDLL:
++    """A second, independent instance of the loaded NCCL library (a private copy of its file, mapped on its own, so it
++    keeps its own once-a-process settings); the copy is unlinked once mapped."""
++
++    import shutil
++    import tempfile
++
++    src = _loaded_path() or getattr(lib, "_name", "")
++    if not src or not os.path.exists(src):
++        raise RuntimeError("TF_NCCL_EXCHANGE_ENV: cannot find the loaded NCCL library's file to copy")
++    tmp = tempfile.mkdtemp(prefix="tf-nccl-exchange-")
++    dst = os.path.join(tmp, "libnccl-exchange.so.2")
++    shutil.copy2(os.path.realpath(src), dst)
++    try:
++        return ctypes.CDLL(dst, mode=getattr(os, "RTLD_LOCAL", 0) | getattr(os, "RTLD_NOW", 2))
++    finally:
++        os.unlink(dst)
++        os.rmdir(tmp)
++
++
++def exchange_env(value: str | None = None) -> dict[str, str]:
++    """TF_NCCL_EXCHANGE_ENV: NCCL_* settings (space separated NAME=VALUE) for the send/receive communicator; empty: off."""
++
++    value = (os.environ.get("TF_NCCL_EXCHANGE_ENV", "") if value is None else value).strip()
++    out: dict[str, str] = {}
++    for item in value.split():
++        name, eq, setting = item.partition("=")
++        if not eq or not name.startswith("NCCL_") or not name.replace("_", "").isalnum():
++            raise ValueError(f"TF_NCCL_EXCHANGE_ENV: NCCL_NAME=value items separated by spaces, not {item!r}")
++        out[name] = setting
++    return out
++
++
++def _bind(lib: ctypes.CDLL) -> None:
++    lib.ncclGetErrorString.restype = ctypes.c_char_p
++    lib.ncclGetErrorString.argtypes = [ctypes.c_int]
++    lib.ncclGetUniqueId.argtypes = [ctypes.POINTER(_UniqueId)]
++    lib.ncclCommInitRank.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, _UniqueId, ctypes.c_int]
++    lib.ncclAllGather.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p,
++                                  ctypes.c_void_p]
++    for name in ("ncclSend", "ncclRecv"):
++        getattr(lib, name).argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
++                                       ctypes.c_void_p, ctypes.c_void_p]
++    lib.ncclGroupStart.argtypes = []
++    lib.ncclGroupEnd.argtypes = []
++
++
+ class NCCL:
+     def __init__(self, rank: int, world: int, master: str, port: int, *, timeout_s: float = 600,
+                  key: str = "tf_nccl_uid") -> None:
+@@ -60,33 +122,43 @@ class NCCL:
+ 
+         self.rank, self.world = rank, world
+         self.lib = _library()
+-        lib = self.lib
+-        lib.ncclGetErrorString.restype = ctypes.c_char_p
+-        lib.ncclGetErrorString.argtypes = [ctypes.c_int]
+-        lib.ncclGetUniqueId.argtypes = [ctypes.POINTER(_UniqueId)]
+-        lib.ncclCommInitRank.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, _UniqueId, ctypes.c_int]
+-        lib.ncclAllGather.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p,
+-                                      ctypes.c_void_p]
+-        for name in ("ncclSend", "ncclRecv"):
+-            getattr(lib, name).argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
+-                                           ctypes.c_void_p, ctypes.c_void_p]
+-        lib.ncclGroupStart.argtypes = []
+-        lib.ncclGroupEnd.argtypes = []
++        _bind(self.lib)
+         self.store = TCPStore(master, port, world, rank == 0, timeout=timedelta(seconds=timeout_s))
++        torch.cuda.current_device()
++        self.comm = self._init(self.lib, key)
++        self.xlib, self.xcomm = self.lib, self.comm
++        settings = exchange_env()
++        if settings:
++            saved = {k: os.environ.get(k) for k in settings}
++            os.environ.update(settings)
++            try:
++                self.xlib = _second_library(self.lib)
++                _bind(self.xlib)
++                self.xcomm = self._init(self.xlib, f"{key}_exchange")
++            finally:
++                for k, v in saved.items():
++                    if v is None:
++                        os.environ.pop(k, None)
++                    else:
++                        os.environ[k] = v
++            if rank == 0:
++                print("[tensorfold] separate NCCL exchange communicator: " + repr(settings), flush=True)
++
++    def _init(self, lib, key):
+         uid = _UniqueId()
+-        if rank == 0:
+-            self._check(self.lib.ncclGetUniqueId(ctypes.byref(uid)))
++        if self.rank == 0:
++            self._check(lib.ncclGetUniqueId(ctypes.byref(uid)), lib)
+             self.store.set(key, bytes(uid.internal))
+         else:
+             raw = self.store.get(key)
+             ctypes.memmove(ctypes.addressof(uid), raw, 128)
+-        self.comm = ctypes.c_void_p()
+-        torch.cuda.current_device()
+-        self._check(self.lib.ncclCommInitRank(ctypes.byref(self.comm), world, uid, rank))
++        comm = ctypes.c_void_p()
++        self._check(lib.ncclCommInitRank(ctypes.byref(comm), self.world, uid, self.rank), lib)
++        return comm
+ 
+-    def _check(self, code: int) -> None:
++    def _check(self, code: int, lib=None) -> None:
+         if code != 0:
+-            raise RuntimeError(f"NCCL error {code}: {self.lib.ncclGetErrorString(code).decode()}")
++            raise RuntimeError(f"NCCL error {code}: {(lib or self.lib).ncclGetErrorString(code).decode()}")
+ 
+     def all_gather(self, send: torch.Tensor, recv: torch.Tensor) -> None:
+         """recv [world * n] <- every rank's send [n], in rank order (contiguous tensors, same dtype)."""
+@@ -132,15 +204,15 @@ class NCCL:
+             if not (s.is_contiguous() and r.is_contiguous()):
+                 raise ValueError("exchange: send and receive must be contiguous")
+         stream = torch.cuda.current_stream().cuda_stream
+-        self._check(self.lib.ncclGroupStart())
++        self._check(self.xlib.ncclGroupStart(), self.xlib)
+         try:
+             for s, r in zip(sends, recvs):
+                 if s.numel():
+-                    self._check(self.lib.ncclSend(s.data_ptr(), s.numel(), _DTYPES[s.dtype], peer, self.comm, stream))
++                    self._check(self.xlib.ncclSend(s.data_ptr(), s.numel(), _DTYPES[s.dtype], peer, self.xcomm, stream), self.xlib)
+                 if r.numel():
+-                    self._check(self.lib.ncclRecv(r.data_ptr(), r.numel(), _DTYPES[r.dtype], peer, self.comm, stream))
++                    self._check(self.xlib.ncclRecv(r.data_ptr(), r.numel(), _DTYPES[r.dtype], peer, self.xcomm, stream), self.xlib)
+         finally:
+-            self._check(self.lib.ncclGroupEnd())
++            self._check(self.xlib.ncclGroupEnd(), self.xlib)
+ 
+     def exchange_all(self, sends: dict[int, list[torch.Tensor]], recvs: dict[int, list[torch.Tensor]]) -> None:
+         """One NCCL group on the current stream with several peers: every ``sends[p][i]`` to peer p and
+@@ -156,15 +228,15 @@ class NCCL:
+                 if s.numel() != r.numel() or s.dtype != r.dtype or not (s.is_contiguous() and r.is_contiguous()):
+                     raise ValueError("exchange_all: each send and receive must be contiguous and alike")
+         stream = torch.cuda.current_stream().cuda_stream
+-        self._check(self.lib.ncclGroupStart())
++        self._check(self.xlib.ncclGroupStart(), self.xlib)
+         try:
+             for p in sorted(sends):
+                 for s, r in zip(sends[p], recvs[p]):
+                     if s.numel():
+-                        self._check(self.lib.ncclSend(s.data_ptr(), s.numel(), _DTYPES[s.dtype], p, self.comm, stream))
+-                        self._check(self.lib.ncclRecv(r.data_ptr(), r.numel(), _DTYPES[r.dtype], p, self.comm, stream))
++                        self._check(self.xlib.ncclSend(s.data_ptr(), s.numel(), _DTYPES[s.dtype], p, self.xcomm, stream), self.xlib)
++                        self._check(self.xlib.ncclRecv(r.data_ptr(), r.numel(), _DTYPES[r.dtype], p, self.xcomm, stream), self.xlib)
+         finally:
+-            self._check(self.lib.ncclGroupEnd())
++            self._check(self.xlib.ncclGroupEnd(), self.xlib)
+ 
+     def barrier(self) -> None:
+         x = torch.zeros((1,), dtype=torch.float32, device="cuda")
+diff --git a/tests/test_full_port_comm.py b/tests/test_full_port_comm.py
+index b6ce396e..fcc40fa8 100644
+--- a/tests/test_full_port_comm.py
++++ b/tests/test_full_port_comm.py
+@@ -14,7 +14,7 @@ def test_asymmetric_exchange_sends_and_receives_independently(monkeypatch,world,
+         def ncclGroupEnd(self): calls.append('end'); return 0
+         def ncclSend(self,ptr,n,dtype,p,*args): calls.append(('send',n,dtype,p)); return 0
+         def ncclRecv(self,ptr,n,dtype,p,*args): calls.append(('recv',n,dtype,p)); return 0
+-    c=NCCL.__new__(NCCL);c.rank=0;c.world=world;c.lib=Lib();c.comm=ctypes.c_void_p()
++    c=NCCL.__new__(NCCL);c.rank=0;c.world=world;c.lib=Lib();c.comm=ctypes.c_void_p();c.xlib=c.lib;c.xcomm=c.comm
+     monkeypatch.setattr(torch.cuda,'current_stream',lambda:SimpleNamespace(cuda_stream=0))
+     c.exchange([torch.zeros(3),torch.zeros(0)],[torch.zeros(5),torch.zeros(2,dtype=torch.int32)],peer)
+     assert calls==['start',('send',3,7,peer),('recv',5,7,peer),('recv',2,2,peer),'end']
+diff --git a/tests/test_nccl_exchange_settings.py b/tests/test_nccl_exchange_settings.py
+new file mode 100644
+index 00000000..8af2de84
+--- /dev/null
++++ b/tests/test_nccl_exchange_settings.py
+@@ -0,0 +1,63 @@
++"""Separate exchange settings preserve gather dispatch and the communicator contract."""
++from types import SimpleNamespace
++import pytest
++
++torch=pytest.importorskip('torch')
++from tensorfold.cuda import comm
++
++@pytest.mark.parametrize('enabled',[False,True])
++def test_constructor_preserves_timeout_and_custom_rendezvous(monkeypatch,enabled):
++    primary,exchange=object(),object();seen=[];stores=[]
++    monkeypatch.setattr(comm,'_library',lambda:primary)
++    monkeypatch.setattr(comm,'_second_library',lambda lib:exchange)
++    monkeypatch.setattr(comm,'_bind',lambda lib:None)
++    monkeypatch.setattr(torch.cuda,'current_device',lambda:0)
++    monkeypatch.setattr(torch.distributed,'TCPStore',lambda *a,**kw:stores.append((a,kw)) or object())
++    monkeypatch.setenv('NCCL_P2P_DISABLE','0')
++    if enabled:monkeypatch.setenv('TF_NCCL_EXCHANGE_ENV','NCCL_P2P_DISABLE=1')
++    else:monkeypatch.delenv('TF_NCCL_EXCHANGE_ENV',raising=False)
++    def initialize(self,lib,key):
++        import os
++        seen.append((lib,key,os.environ['NCCL_P2P_DISABLE']))
++        return key
++    monkeypatch.setattr(comm.NCCL,'_init',initialize)
++    c=comm.NCCL(0,4,'192.0.2.1',29582,timeout_s=123,key='custom')
++    assert stores[0][0]==('192.0.2.1',29582,4,True)
++    assert stores[0][1]['timeout'].total_seconds()==123
++    assert seen==([(primary,'custom','0'),(exchange,'custom_exchange','1')] if enabled else [(primary,'custom','0')])
++    assert c.lib is primary and c.xlib is (exchange if enabled else primary)
++    import os
++    assert os.environ['NCCL_P2P_DISABLE']=='0'
++
++def test_environment_restored_if_second_library_fails(monkeypatch):
++    monkeypatch.setattr(comm,'_library',object)
++    monkeypatch.setattr(comm,'_bind',lambda lib:None)
++    monkeypatch.setattr(comm.NCCL,'_init',lambda self,lib,key:key)
++    monkeypatch.setattr(torch.cuda,'current_device',lambda:0)
++    monkeypatch.setattr(torch.distributed,'TCPStore',lambda *a,**kw:object())
++    monkeypatch.setenv('TF_NCCL_EXCHANGE_ENV','NCCL_P2P_DISABLE=1 NCCL_PROTO=LL')
++    monkeypatch.setenv('NCCL_P2P_DISABLE','0');monkeypatch.delenv('NCCL_PROTO',raising=False)
++    def fail(lib):raise RuntimeError('copy failed')
++    monkeypatch.setattr(comm,'_second_library',fail)
++    with pytest.raises(RuntimeError,match='copy failed'):comm.NCCL(0,4,'192.0.2.1',29582)
++    import os
++    assert os.environ['NCCL_P2P_DISABLE']=='0' and 'NCCL_PROTO' not in os.environ
++
++def test_gather_and_asymmetric_exchange_use_their_own_libraries(monkeypatch):
++    class Lib:
++        def __init__(self):self.calls=[]
++        def __getattr__(self,name):
++            def call(*args):self.calls.append((name,args));return 0
++            return call
++    c=object.__new__(comm.NCCL);c.rank=0;c.world=4;c.lib=Lib();c.xlib=Lib();c.comm='gather';c.xcomm='exchange'
++    monkeypatch.setattr(torch.cuda,'current_stream',lambda:SimpleNamespace(cuda_stream=7))
++    c.all_gather(torch.zeros(3),torch.zeros(12))
++    c.exchange([torch.zeros(3),torch.zeros(0)],[torch.zeros(5),torch.zeros(2,dtype=torch.int32)],3)
++    assert [n for n,a in c.lib.calls]==['ncclAllGather']
++    assert c.lib.calls[0][1][-2:]==('gather',7)
++    assert [(n,a[1],a[3],a[-2:]) for n,a in c.xlib.calls if n in ('ncclSend','ncclRecv')]==[
++        ('ncclSend',3,3,('exchange',7)),('ncclRecv',5,3,('exchange',7)),('ncclRecv',2,3,('exchange',7))]
++
++def test_invalid_environment_fields_fail_before_library_loading():
++    for value in ('PATH=1','NCCL_BAD-NAME=1','NCCL_PROTO'):
++        with pytest.raises(ValueError):comm.exchange_env(value)

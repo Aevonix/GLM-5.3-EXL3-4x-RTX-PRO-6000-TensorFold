@@ -1,0 +1,219 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/host_tier.py b/src/tensorfold/families/glm5_next/cuda/host_tier.py
+new file mode 100644
+index 00000000..16667c03
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/host_tier.py
+@@ -0,0 +1,124 @@
++"""Bounded pageable read-through cache; all budgets are per engine rank.
++
++The request thread is the sole allocator. Only completely verified reads are
++published; every hit passes the same section checksums as a disk read.
++"""
++from collections import OrderedDict
++from pathlib import Path
++import threading
++
++
++class HostTier:
++    def __init__(self, budget=0, *, world=1, reserve=48 << 30):
++        self.budget = max(0, int(budget))
++        self.world, self.reserve = max(1, int(world)), max(0, int(reserve))
++        self.entries = OrderedDict()
++        self.held = 0
++        self.lock = threading.RLock()
++        self.hits = self.misses = self.evictions = self.pressure = self.failed = 0
++
++    @staticmethod
++    def available():
++        """Host and cgroup headroom, including ancestor limits; fail closed."""
++        try:
++            available = next(int(s.split()[1]) * 1024 for s in
++                             Path('/proc/meminfo').read_text().splitlines()
++                             if s.startswith('MemAvailable:'))
++            for line in Path('/proc/self/cgroup').read_text().splitlines():
++                _, controllers, name = line.split(':', 2)
++                if not controllers:
++                    root, limit, current = Path('/sys/fs/cgroup'), 'memory.max', 'memory.current'
++                elif 'memory' in controllers.split(','):
++                    root, limit, current = Path('/sys/fs/cgroup/memory'), 'memory.limit_in_bytes', 'memory.usage_in_bytes'
++                else:
++                    continue
++                path = root / name.lstrip('/')
++                # A cgroup namespace can expose this process at the mount root.
++                if not path.exists():
++                    path = root
++                while path == root or root in path.parents:
++                    if (path / limit).exists():
++                        value = (path / limit).read_text().strip()
++                        if value != 'max':
++                            available = min(available, max(0, int(value) - int((path / current).read_text())))
++                    if path == root:
++                        break
++                    path = path.parent
++            return available
++        except (OSError, ValueError, StopIteration):
++            return 0
++
++    @staticmethod
++    def key(path):
++        path = Path(path)
++        st = path.stat()
++        return (str(path), st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
++
++    def _evict(self):
++        _, old = self.entries.popitem(last=False)
++        self.held -= len(old)
++        self.evictions += 1
++
++    def trim(self):
++        with self.lock:
++            while self.entries and self.available() < self.reserve:
++                self._evict()
++                self.pressure += 1
++
++    def discard(self, key):
++        with self.lock:
++            old = self.entries.pop(key, None)
++            if old is not None:
++                self.held -= len(old)
++
++    def get(self, key):
++        self.trim()
++        with self.lock:
++            # Replacing a file must not leave its previous allocation stranded.
++            for old in list(self.entries):
++                if old[0] == key[0] and old != key:
++                    self.discard(old)
++            value = self.entries.get(key)
++            if value is not None:
++                self.entries.move_to_end(key)
++                self.hits += 1
++            else:
++                self.misses += 1
++            return value
++
++    def allocate(self, size):
++        self.trim()
++        if not self.budget or size > self.budget or size < 0:
++            return None
++        with self.lock:
++            while self.entries and self.held + size > self.budget:
++                self._evict()
++            if self.available() < self.world * size + self.reserve:
++                self.pressure += 1
++                return None
++        try:
++            return bytearray(size)
++        except (MemoryError, OverflowError):
++            self.failed += 1
++            return None
++
++    def publish(self, key, value):
++        with self.lock:
++            self.trim()
++            if len(value) > self.budget or self.available() < self.reserve:
++                return
++            self.discard(key)
++            while self.entries and self.held + len(value) > self.budget:
++                self._evict()
++            self.entries[key] = value
++            self.held += len(value)
++
++    def clear(self):
++        with self.lock:
++            self.entries.clear()
++            self.held = 0
++
++    def stats(self):
++        return dict(bytes=self.held, budget_bytes=self.budget, entries=len(self.entries),
++                    hits=self.hits, misses=self.misses, evictions=self.evictions,
++                    pressure=self.pressure, allocation_failures=self.failed)
+diff --git a/src/tensorfold/families/glm5_next/cuda/pcache.py b/src/tensorfold/families/glm5_next/cuda/pcache.py
+index ff21deea..874a2e39 100644
+--- a/src/tensorfold/families/glm5_next/cuda/pcache.py
++++ b/src/tensorfold/families/glm5_next/cuda/pcache.py
+@@ -428,11 +428,41 @@ def check_header(meta: dict, expect: dict) -> None:
+ 
+ 
+ def read_sections(path: Path, meta: dict, dests: dict[str, torch.Tensor], *, staging: Staging,
+-                  pool: ThreadPoolExecutor | None, direct: bool = True) -> None:
++                  pool: ThreadPoolExecutor | None, direct: bool = True, host_tier=None) -> None:
+     """Every section of a validated header into ``dests[name]`` (contiguous tensors of its dtype and shape, on any
+     device; the live caches' rows included), piece by piece through the staging ring, each piece checksummed before
+     it is copied out. Raises PCacheError (a destination may then hold part of the file)."""
+ 
++    tier = host_tier if host_tier is not None and host_tier.budget else None
++    try:
++        key = tier.key(path) if tier is not None else None
++    except OSError as err:
++        raise PCacheError(f"cannot stat: {err}") from None
++    host = tier.get(key) if tier is not None else None
++    hit = host is not None
++    if tier is not None and not hit:
++        host = tier.allocate(meta["file_bytes"])
++    try:
++        _read_sections(path, meta, dests, staging=staging, pool=pool, direct=direct, host=host, host_hit=hit)
++        if tier is not None and tier.key(path) != key:
++            raise PCacheError("state file changed during read")
++    except Exception:
++        if tier is not None:
++            tier.discard(key)
++        if not hit:
++            raise
++        # A corrupt RAM copy does not discard the durable state. Retry through
++        # its checksums; the caller still performs cross-rank agreement.
++        _read_sections(path, meta, dests, staging=staging, pool=pool, direct=direct)
++        if tier.key(path) != key:
++            raise PCacheError("state file changed during retry")
++        return
++    if host is not None and not hit:
++        tier.publish(key, host)
++
++
++def _read_sections(path, meta, dests, *, staging, pool, direct, host=None, host_hit=False):
++
+     start, algo = meta["data_start"], meta.get("sum", SUM)
+     secs = meta["sections"]
+     for s in secs:
+@@ -461,7 +491,13 @@ def read_sections(path: Path, meta: dict, dests: dict[str, torch.Tensor], *, sta
+                 lo, _ = staging.slot(i)
+                 mv = staging.buf.view(lo, lo + round_up(b - a))
+                 try:
+-                    _pread(fd, mv, start + s["offset"] + a)
++                    offset = start + s["offset"] + a
++                    if host_hit:
++                        mv[:] = memoryview(host)[offset:offset + len(mv)]
++                    else:
++                        _pread(fd, mv, offset)
++                        if host is not None:
++                            memoryview(host)[offset:offset + len(mv)] = mv
+                     if "%016x" % checksum(mv[:b - a], algo) != s["sums"][a // PIECE]:
+                         raise PCacheError(f"section {s['name']}: checksum mismatch at {a}")
+                 finally:
+@@ -614,6 +650,10 @@ class DiskCache:
+         self.read_pool = ThreadPoolExecutor(self.threads, thread_name_prefix="tf-pcache-read")
+         self.write_pool = ThreadPoolExecutor(self.threads, thread_name_prefix="tf-pcache-write")
+         self.stream = torch.cuda.Stream() if pin else None
++        from .host_tier import HostTier
++
++        self.host_tier = HostTier(int(_env_float("TF_GLM_HOST_CACHE_GIB", 0) * 2 ** 30), world=world,
++                                  reserve=int(_env_float("TF_GLM_HOST_RESERVE_GIB", 48) * 2 ** 30))
+         self.writer = Writer(self, depth)
+ 
+     @classmethod
+@@ -815,12 +855,14 @@ class DiskCache:
+ 
+     def read(self, ids: Sequence[int], meta: dict, dests: dict[str, torch.Tensor]) -> None:
+         read_sections(self.path(self.key(ids)), meta, dests, staging=self.read_staging, pool=self.read_pool,
+-                      direct=self.direct)
++                      direct=self.direct, host_tier=self.host_tier)
++        self.log(f"prompt host tier: {self.host_tier.stats()}")
+ 
+     def close(self) -> None:
+         self.writer.drain()
+         self.read_pool.shutdown()
+         self.write_pool.shutdown()
++        self.host_tier.clear()
+ 
+ 
+ # -- a state back ------------------------------------------------------------------------------------------------------

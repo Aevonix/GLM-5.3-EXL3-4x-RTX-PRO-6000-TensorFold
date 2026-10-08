@@ -1,0 +1,320 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/decode.py b/src/tensorfold/families/glm5_next/cuda/decode.py
+index 8d7d3b00..f6d620ab 100644
+--- a/src/tensorfold/families/glm5_next/cuda/decode.py
++++ b/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -535,26 +535,29 @@ def local_rows(n: int, rank: int, cp: int) -> int:
+     return max(0, (int(n) - int(rank) + cp - 1) // cp)
+ 
+ 
+-def _row_views(st, n: int, m: int) -> list[torch.Tensor]:
++def _row_views(st, n: int, m: int, *, paged_io=False) -> list[torch.Tensor]:
+     """Views of the attention rows a snapshot of n tokens (m in the MTP head) depends on: latents or keys and values,
+     and the indexer's pooled keys (its per-token keys and gates live in rings: the snapshot's ``tail``). Under
+     context parallelism (full GLM-5.3) a rank's planes hold its own positions only: its local rows of n (and m)."""
++    def prefix(view, count):
++        return view.section(count) if paged_io and hasattr(view, "section") else view[:count]
++
+     caches = getattr(st, "caches", None)
+     cp = int(getattr(caches, "cp", 1) or 1)
+     has_mtp = m > 0 and getattr(st, "mtp_kc", None) is not None      # by the positions, alike on every rank
+     if cp > 1:
+         rank = int(caches.rank)
+         n, m = local_rows(n, rank, cp), local_rows(max(m, 0), rank, cp)
+-    views = [kc[:n] for kc in st.kc] + [vc[:n] for vc in st.vc if vc is not None]
++    views = [prefix(kc, n) for kc in st.kc] + [prefix(vc, n) for vc in st.vc if vc is not None]
+     idx = st.index or []
+     if idx and idx[0][0] is None:        # full GLM-5.3: rotary keys, per-token index keys (full layers, then MTP)
+-        views += [kr[:n] for kr in getattr(st, "kr", [])]
+-        views += [pk[:n] for _, _, pk in (idx[:-1] if has_mtp or getattr(st, "mtp_kr", None) is not None else idx)]
++        views += [prefix(kr, n) for kr in getattr(st, "kr", [])]
++        views += [prefix(pk, n) for _, _, pk in (idx[:-1] if has_mtp or getattr(st, "mtp_kr", None) is not None else idx)]
+         if has_mtp:
+-            views += [st.mtp_kc[:m], st.mtp_kr[:m], idx[-1][2][:m]]
++            views += [prefix(st.mtp_kc, m), prefix(st.mtp_kr, m), prefix(idx[-1][2], m)]
+         return views
+     if getattr(st, "kr", None):
+-        views += [kr[:n] for kr in st.kr]
++        views += [prefix(kr, n) for kr in st.kr]
+     main_idx = idx[:len(st.kc)]
+     for _, _, pk in main_idx:
+         views.append(pk[:n // 4 + 1])
+@@ -576,11 +579,11 @@ def _drafter_views(drafter, n: int) -> list[torch.Tensor]:
+     return [c[:, lo:n] for c in drafter.kc] + [c[:, lo:n] for c in drafter.vc]
+ 
+ 
+-def _saved_views(e: Engine, snap: Snapshot, drafter=None) -> list[torch.Tensor]:
++def _saved_views(e: Engine, snap: Snapshot, drafter=None, *, paged_io=False) -> list[torch.Tensor]:
+     """The rows ``save_rows`` copies: the attention rows, and with ``drafter`` (whose context the snapshot ends at)
+     DFlash2's window rows."""
+     n = len(snap.ids)
+-    views = _row_views(e.st, n, max(snap.mtp_len, 0))
++    views = _row_views(e.st, n, max(snap.mtp_len, 0), paged_io=paged_io)
+     if drafter is not None and snap.drafter_end == n and not getattr(drafter, "ring", 0):   # a ring's: drafter_rows
+         views += _drafter_views(drafter, n)
+     return views
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi.py b/src/tensorfold/families/glm5_next/cuda/multi.py
+index d2b6b8de..9a780b05 100644
+--- a/src/tensorfold/families/glm5_next/cuda/multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/multi.py
+@@ -65,7 +65,8 @@ from .pool import ALIGN, Pool, align_up
+ from .verify import FULL_MAX_ROWS, BatchedVerify, FullBatchedVerify, Segment, SerialVerify, Verified
+ 
+ ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT, MFILL, FILLPART, MFILLPART = range(1, 13)
+-OPS = {ADMIT: "ADMIT", EVICT: "EVICT", MOVE: "MOVE", GROW: "GROW", FILL: "FILL", ROUND: "ROUND", FINISH: "FINISH",
++RESTORE = 13
++OPS = {RESTORE: "RESTORE", ADMIT: "ADMIT", EVICT: "EVICT", MOVE: "MOVE", GROW: "GROW", FILL: "FILL", ROUND: "ROUND", FINISH: "FINISH",
+        IDLE: "IDLE", SLOT: "SLOT", MFILL: "MFILL", FILLPART: "FILLPART", MFILLPART: "MFILLPART"}
+ 
+ 
+@@ -856,6 +857,20 @@ class MultiDecoder:
+             self.broken = exc
+             raise
+         self.lanes[sid].key = key
++        if hit is None and draft and s.vision is None and getattr(g, "disk", None) is not None:
++            def fits(entry):
++                n = int(entry["n"])
++                return (n > 0 and (not self.grid or n % self.grid == 0)
++                        and (self.drafts is None or entry.get("drafter") and entry.get("ring"))
++                        and (n < len(prompt) or n == len(prompt) and entry.get("head")))
++            parked = g.disk.lookup(prompt, fits)
++            if parked is not None:
++                n = int(parked["n"])
++                self._emit(RESTORE, [sid, n])
++                # Followers must receive ADMIT and RESTORE before the header and
++                # payload all-gathers. Otherwise a batched outbox deadlocks.
++                self._flush()
++                self._restore_parked(sid, n)
+ 
+     def _encode(self, prepared, cut: int):
+         """Rank 0: the tower's rows of the pictures a prompt resumed at ``cut`` still fills (those whose rows end past
+@@ -1029,9 +1044,84 @@ class MultiDecoder:
+         while len(self.kept) > max(1, self.g.cache_entries):
+             self._drop(cap_victim(self.kept))
+ 
++    def _restore_parked(self, sid, n):
++        """Restore into a fresh lane; partial failures cold-fill that lane only."""
++        from .pcache import load_snapshot
++        from .engine import grid_point
++        from .decode import put_ring_tail
++
++        lane, d = self.lanes[sid], self.g.disk
++        ids = lane.s.prompt[:n]
++        meta, snap, why = None, None, ""
++        started = time.perf_counter()
++        try:
++            meta = d.check(ids)
++        except Exception as err:
++            why = repr(err)
++        if min(r[0] for r in self.g._gather_ints([int(meta is not None)])):
++            prev = self.e.use(lane.st)
++            try:
++                snap = load_snapshot(d, self.e, ids, meta, live=True)
++                if lane.dflash and (snap.drafter_end != n or snap.drafter_rows is None):
++                    raise ValueError("parked state has no drafter window")
++                # Include small-state shape/application errors in agreement too.
++                if lane.st.cur:
++                    lane.st.rec[lane.st.cur[0]].copy_(snap.rec)
++                lane.st.conv.copy_(snap.conv)
++                put_ring_tail(lane.st, snap)
++                if lane.dflash:
++                    put_draft_window(self._ctx(lane), n, snap.drafter_rows)
++                if n == len(lane.s.prompt) and snap.head is None:
++                    raise ValueError("parked replay has no head row")
++            except Exception as err:
++                snap, why = None, repr(err)
++            finally:
++                self.e.use(prev)
++            ok = min(r[0] for r in self.g._gather_ints([int(snap is not None)]))
++        else:
++            ok = False
++        if not ok:
++            lane.st.reset()
++            if self.drafts is not None:
++                self._ctx(lane).reset()
++            d.remove(d.key(ids))
++            d.stats["misses"] += 1
++            d.log(f"parked prompt miss: {n} tokens ({why or 'another rank'})")
++            return
++        lane.st.set_pos(n)
++        lane.s.cached = n
++        lane.head = snap.head if n == len(lane.s.prompt) else None
++        lane.point = grid_point(len(lane.s.prompt), n, self.grid)
++        lane.shared = [p for p in lane.shared if n < p]
++        lane.stops = list(lane.shared) + ([lane.point] if lane.point is not None
++                                         and lane.point < len(lane.s.prompt) else [])
++        d.touch(d.key(ids))
++        d.stats["hits"] += 1
++        d.log(f"parked prompt restored: {n} tokens in {time.perf_counter() - started:.3f}s")
++
++    def _park(self, c):
++        d = getattr(self.g, "disk", None)
++        if d is None or c.images:
++            return
++        from .forward import State
++        from types import SimpleNamespace
++
++        try:
++            # Only attention-plane bindings are read from this temporary view;
++            # recurrent and draft state belong to the immutable snapshot itself.
++            st = State(self.w, c.extent.size, self.e.rows, caches=self.e.caches,
++                       base=c.extent.base, slots=self.e.slots, slot=0)
++            started = time.perf_counter()
++            d.park(SimpleNamespace(st=st), c)
++            d.log(f"parked prompt write: {len(c.ids)} tokens in {time.perf_counter() - started:.3f}s")
++        except Exception as err:
++            d.stats["failed"] += 1
++            d.log(f"parked prompt write skipped: {err!r}")
++
+     def _drop(self, c) -> None:
+         """Forget a kept prompt; its extent goes when nothing else holds it, else shrinks to what is kept."""
+ 
++        self._park(c)
+         self.kept = [k for k in self.kept if k is not c]
+         x = c.extent
+         x.kept = [k for k in x.kept if k is not c]
+@@ -1800,6 +1890,8 @@ class MultiDecoder:
+                     feed = VisionFeed(self.g, list(a["positions"]), None)
+                     s.vision = feed
+                 self._admitted(a, s, feed, constraint)
++            elif op == RESTORE:
++                self._restore_parked(p[0], p[1])
+             elif op == EVICT:
+                 self._drop(self._kept_by_id(p[0]))
+             elif op == MOVE:
+diff --git a/src/tensorfold/families/glm5_next/cuda/paged_cp.py b/src/tensorfold/families/glm5_next/cuda/paged_cp.py
+index e9fb9d8a..326db447 100644
+--- a/src/tensorfold/families/glm5_next/cuda/paged_cp.py
++++ b/src/tensorfold/families/glm5_next/cuda/paged_cp.py
+@@ -50,15 +50,59 @@ class PagedView:
+     def clone(self):
+         return self.gather()
+ 
++    def section(self, count):
++        return PagedSection(self, count)
++
+     def __getitem__(self, key):
+-        # Diagnostic/snapshot reads; live multi-stream snapshots retain extents,
+-        # never materialize all target layers. Disk restore is refused in this mode.
++        # Diagnostic reads. Snapshot I/O uses section() to bound its staging.
+         if isinstance(key, slice) and key.step in (None, 1):
+             a, z, _ = key.indices(self.shape[0])
+             return self.gather(z-a, a)
+         return self.gather()[key]
+ 
+ 
++class PagedSection:
++    """Tensor-shaped file section with bounded raw-byte gather/scatter.
++
++    A checksum piece may end inside a row (for example 132-byte FP4X index
++    rows). Preserve both partial boundary rows on writes, with no conversion
++    of the packed bytes. At most one piece plus two rows is materialized.
++    """
++    def __init__(self, view, count):
++        if not 0 <= count <= view.shape[0]:
++            raise ValueError('snapshot outside paged extent')
++        self.view = view
++        self.shape = torch.Size((count, *view.shape[1:]))
++        self.dtype, self.device = view.dtype, view.device
++        self.is_cuda = self.device.type == 'cuda'
++
++    def numel(self):
++        return self.shape.numel()
++
++    def element_size(self):
++        return self.view.tensor.element_size()
++
++    def is_contiguous(self):
++        return True
++
++    def _piece(self, a, b):
++        if not 0 <= a <= b <= self.numel() * self.element_size():
++            raise ValueError('snapshot byte range outside section')
++        width = self.view.tensor[0].numel() * self.element_size()
++        lo, hi = a // width, -(-b // width)
++        rows = self.view.gather(hi - lo, lo)
++        return rows, lo, a - lo * width, b - lo * width
++
++    def read_bytes(self, a, b):
++        rows, _, start, end = self._piece(a, b)
++        return rows.reshape(-1).view(torch.uint8)[start:end]
++
++    def write_bytes(self, a, value):
++        rows, lo, start, end = self._piece(a, a + value.numel())
++        rows.reshape(-1).view(torch.uint8)[start:end].copy_(value)
++        self.view.write(lo, rows)
++
++
+ class PagedArena(Arena):
+     def __init__(self, rows, planes):
+         super().__init__(rows, planes)
+diff --git a/src/tensorfold/families/glm5_next/cuda/pcache.py b/src/tensorfold/families/glm5_next/cuda/pcache.py
+index 874a2e39..1f291089 100644
+--- a/src/tensorfold/families/glm5_next/cuda/pcache.py
++++ b/src/tensorfold/families/glm5_next/cuda/pcache.py
+@@ -215,7 +215,7 @@ def snapshot_sections(e, snap, drafter=None) -> tuple[dict, list[tuple[str, torc
+     # the drafter context the file keeps: a ring drafter's window rows (copied when kept), or a sliding window's rows
+     # given ``drafter`` (TF_GLM_SHARED_PREFIX, as save_rows); none otherwise
+     keeps_drafter = snap.drafter_end == n and (snap.drafter_rows is not None or (drafter is not None and not ring))
+-    rows = snap.rows if snap.rows is not None else _saved_views(e, snap, drafter if keeps_drafter else None)
++    rows = snap.rows if snap.rows is not None else _saved_views(e, snap, drafter if keeps_drafter else None, paged_io=True)
+     out: list[tuple[str, torch.Tensor]] = [("ids", torch.tensor(list(snap.ids), dtype=torch.int32)),
+                                            ("rec", snap.rec), ("conv", snap.conv)]
+     if snap.pending is not None:
+@@ -300,7 +300,8 @@ def write_file(path: Path, meta: dict, tensors: list[tuple[str, torch.Tensor]],
+             with ctx:
+                 for i, (s, t, a, b) in enumerate(wave):
+                     dst = staging.tensor(i, round_up(b - a))
+-                    dst[:b - a].copy_(_u8(t)[a:b], non_blocking=cuda)
++                    source = t.read_bytes(a, b) if hasattr(t, "read_bytes") else _u8(t)[a:b]
++                    dst[:b - a].copy_(source, non_blocking=cuda)
+                     if b - a < dst.numel():
+                         dst[b - a:].zero_()
+             if cuda:
+@@ -511,7 +512,10 @@ def _read_sections(path, meta, dests, *, staging, pool, direct, host=None, host_
+             cuda = False
+             for i, (s, t, a, b) in enumerate(wave):
+                 cuda = cuda or t.is_cuda
+-                _u8(t)[a:b].copy_(staging.tensor(i, b - a), non_blocking=t.is_cuda)
++                if hasattr(t, "write_bytes"):
++                    t.write_bytes(a, staging.tensor(i, b - a))
++                else:
++                    _u8(t)[a:b].copy_(staging.tensor(i, b - a), non_blocking=t.is_cuda)
+             if cuda:
+                 torch.cuda.current_stream().synchronize()      # the staging slots are reused by the next wave
+     except OSError as err:
+@@ -818,6 +822,26 @@ class DiskCache:
+             self.stats["skipped"] += 1
+         return ok
+ 
++    def park(self, e, snap):
++        """Persist an evicted extent before its pages can be reused.
++
++        Multi-session only: the scheduler owns the pages throughout this call.
++        No collective or whole-state clone; the existing bounded staging ring
++        gathers pieces on the writer stream. Failures remain ordinary misses.
++        """
++        key = self.key(snap.ids)
++        if self.contains(key):
++            self.touch(key)
++            return
++        self.writer.drain()
++        fields, tensors = snapshot_sections(e, snap)
++        digest = ids_digest(snap.ids)
++        meta = dict(fields, identity=self.identity, rank=self.rank, world=self.world, cp=self.cp, kv=self.kv,
++                    ids_sha256=digest, created=time.time())
++        entry = dict(n=len(snap.ids), ids=digest, identity=self.identity, mtp=False,
++                     drafter=fields["drafter_end"] == len(snap.ids), ring=fields["drafter_ring"], head=fields["head"])
++        self._write(Job(key, self.path(key), meta, tensors, entry))
++
+     def _write(self, job: Job) -> None:
+         secs, data = _layout(job.tensors)
+         need = round_up(PREFIX.size + len(_header_bytes(dict(job.meta, sections=secs, sum=SUM, version=VERSION)))) \
+@@ -895,7 +919,7 @@ def load_snapshot(cache_or_path, e, ids: Sequence[int], meta: dict, *, drafter=N
+     keeps_drafter = snap.drafter_end == n
+     ring = drafter is not None and getattr(drafter, "ring", 0)
+     view_drafter = drafter if keeps_drafter and not ring and not meta.get("drafter_ring") else None
+-    views = _saved_views(e, snap, view_drafter)
++    views = _saved_views(e, snap, view_drafter, paged_io=live)
+     rows = [k for k in secs if k.startswith("rows.")]
+     if len(rows) != len(views) or int(meta.get("rows", -1)) != len(views):
+         raise PCacheError(f"{len(rows)} row sections, the engine's caches {len(views)}")

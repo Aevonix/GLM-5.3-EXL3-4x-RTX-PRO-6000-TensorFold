@@ -1,0 +1,491 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 2dee1b7f..bbdb2f79 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -435,9 +435,12 @@ def parallel_refusal(parallel: int, *, full: bool, drafter: bool, dspark: bool,
+     if parallel <= 1:
+         return None
+     if cp > 1:
+-        return (f"--parallel {parallel}: TF_GLM_CP=1 (context parallelism) serves one request at a time; concurrent "
+-                "requests under context parallelism are not built yet: serve --parallel N with TF_GLM_CP=0, or "
+-                "TF_GLM_CP=1 with --parallel 1")
++        if os.environ.get("TF_GLM_CP_MULTI", "0") != "1":
++            return "concurrent CP is experimental: set TF_GLM_CP_MULTI=1 after exactness qualification"
++        if os.environ.get("TF_GLM_MULTI_VERIFY", "segments") not in ("segments", "serial"):
++            return "concurrent CP requires TF_GLM_MULTI_VERIFY=segments or serial"
++        if os.environ.get("TF_GLM_MULTI_PREFILL", "0") != "0":
++            return "concurrent CP requires TF_GLM_MULTI_PREFILL=0 (independent prompt chunks)"
+     if drafter or serial_only:
+         return None                  # a DFlash2 drafter on full GLM-5.3 is refused with the full checks
+     if full:
+@@ -454,7 +457,7 @@ def parallel_refusal(parallel: int, *, full: bool, drafter: bool, dspark: bool,
+ 
+ 
+ def full_multi_bytes(t: dict, parallel: int, slots: int, *, world: int, share, kv: str, mtp: bool,
+-                     prompt_split_k: bool) -> int:
++                     prompt_split_k: bool, cp: int = 1, pool_tokens: int = 0) -> int:
+     """--parallel N on full GLM-5.3 (no context parallelism): what N streams add on a rank to the one-stream
+     geometry at ``slots`` cache slots A STREAM (the admitted window is each stream's; the pool holds N of them): the
+     other N - 1 streams' per-token caches (``geometry.full_token_bytes``; MLA's cache is the same on every rank)
+@@ -469,9 +472,15 @@ def full_multi_bytes(t: dict, parallel: int, slots: int, *, world: int, share, k
+ 
+     if parallel <= 1:
+         return 0
+-    return ((parallel - 1) * slots * full_token_bytes(t, kv, mtp)
+-            + full_buffer_bytes(t, FULL_MAX_ROWS, world=world, share=share, capacity=parallel * slots,
+-                                prefill=False, prompt_split_k=prompt_split_k)
++    aligned = -(-slots // 2048) * 2048
++    total = pool_tokens or parallel * aligned
++    # 061 extends geometry with the same CP/MTP omissions as Buffers. Keep060
++    # usable without that optional patch while charging the lean layout accurately.
++    import inspect
++    layout = dict(cp=cp, mtp=mtp) if "cp" in inspect.signature(full_buffer_bytes).parameters else {}
++    return ((-(-total // cp) - (-(-slots // cp))) * full_token_bytes(t, kv, mtp)
++            + full_buffer_bytes(t, FULL_MAX_ROWS, world=world, share=share, capacity=total,
++                                prefill=False, prompt_split_k=prompt_split_k, **layout)
+             + parallel * 16)
+ 
+ 
+@@ -520,13 +529,33 @@ def dspark_multi_bytes(draft_dir, parallel: int, rank: int, world: int, *, capac
+     return parallel * (m["kv"] + m["fixed"])
+ 
+ 
++def cp_pool_budget(value: str, *, cp: int, parallel: int, context: int | None) -> int:
++    """Optional shared token budget independent of the maximum window per request.
++
++    Existing pool admission queues prompts until their extents fit. A request may
++    use the full declared window; simultaneous requests need not all be that long.
++    """
++    tokens = int(value or "0")
++    if not tokens:
++        return 0
++    if cp <= 1 or parallel <= 1 or not context or context < 0:
++        raise ValueError("TF_GLM_CP_POOL_TOKENS requires concurrent CP and an explicit positive context")
++    if tokens < 0 or tokens % 2048 or 2048 % cp:
++        raise ValueError("TF_GLM_CP_POOL_TOKENS must be positive whole rank-aligned 2048-token pages")
++    if tokens < -(-(context + MAX_ROWS) // 2048) * 2048:
++        raise ValueError("TF_GLM_CP_POOL_TOKENS must fit one whole context plus speculative guard rows")
++    return tokens
++
++
+ def full_pool_rows(slots: int, parallel: int, spare: int, token_bytes: int, align: int) -> tuple[int, int]:
+     """--parallel N on full GLM-5.3: (the pool's tokens, the most one stream holds). The admitted window is each
+     stream's: the pool is N windows (``slots`` cache slots each) plus what ``spare`` bytes (TF_GLM_CACHE_GIB beyond
+     the kept prompts' drafter windows) hold of other conversations' kept prompts, in whole ``align``-token extents;
+     a stream holds at most an even split of it, so N streams at their longest always fit together."""
+ 
+-    pool = (parallel * slots + max(0, spare) // max(1, token_bytes)) // align * align
++    # Reserve whole extents including each stream's speculative output guard.
++    # Rounding the combined pool down used to silently shorten each advertised window.
++    pool = parallel * (-(-slots // align) * align) + max(0, spare) // max(1, token_bytes) // align * align
+     return pool, pool // parallel // align * align
+ 
+ 
+@@ -796,6 +825,8 @@ class GlmEngine:
+         # (``forward.dsa_full_cp``); one request at a time, eager decode windows (for now); kept prompt states hold
+         # each rank's own rows of their positions (``decode.local_rows``), in memory and on disk alike
+         self.cp = world if cfg.full and os.environ.get("TF_GLM_CP", "0").strip() == "1" else 1
++        self.cp_pool_tokens = cp_pool_budget(os.environ.get("TF_GLM_CP_POOL_TOKENS", "0"),
++                                            cp=self.cp, parallel=parallel, context=context)
+         from .forward import CP_KV_GATHER, CP_PARTS_EDGE, cp_raw_q_on
+ 
+         # TF_GLM_CP_RAW_Q: the other ranks' absorb key rows replicated (prompt chunks gather raw queries); the estimate
+@@ -851,12 +882,13 @@ class GlmEngine:
+                     from .dspark import DSparkConfig
+ 
+                     draft_layers = DSparkConfig.read(Path(drafter)).layers
+-                seg = dict(graphs=bool(graphs), verify=verify_kind(full=True), mode=graph_mode(),
++                seg = dict(graphs=bool(graphs) and self.cp == 1, verify=verify_kind(full=True), mode=graph_mode(),
+                            draft_layers=draft_layers, tap_rows=MAX_ROWS,
+                            draft_graphs=os.environ.get("TF_GLM_MULTI_DRAFT_GRAPHS", "1") != "0")
+                 return Geometry(lambda slots: g.bytes_at(slots) + full_multi_bytes(
+                     text, parallel, slots, world=world, share=share, kv=kv, mtp=self.mtp_on,
+-                    prompt_split_k=dense_kind() not in ("q4",)) + full_seg_multi_bytes(text, parallel, slots, **seg),
++                    prompt_split_k=dense_kind() not in ("q4",), cp=self.cp,
++                    pool_tokens=self.cp_pool_tokens) + full_seg_multi_bytes(text, parallel, slots, **seg),
+                     g.reserve, g.minimum_slots)
+             g = mla_geometry(text, world, MAX_ROWS, share=share, minimum_slots=DENSE_CAPACITY, latent=LATENT,
+                              prefill_rows=prompt_buffer_rows,
+@@ -944,13 +976,14 @@ class GlmEngine:
+                                  parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
+                                  sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0),
+                                  KV_KINDS.index(kv), self.cp, int(cp_raw_q), int(CP_PARTS_EDGE),
+-                                 int(CP_KV_GATHER)]
++                                 int(CP_KV_GATHER), int(os.environ.get("TF_GLM_CP_MULTI", "0"))]
+         # TF_GLM_DISK_CACHE (``pcache``): every rank takes part in a disk hit's agreement, so all have it or none
+         disk_on = int(bool(os.environ.get("TF_GLM_DISK_CACHE", "").strip() not in ("", "0", "off")) and parallel == 1)
+         mine.append(disk_on)
++        mine.append(self.cp_pool_tokens)
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+-        wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
++        wanted = 0 if self.cp_pool_tokens else int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+         spare = max(0, min(wanted, plan["budget_bytes"] - plan["total_bytes_estimate"]))
+         rows = self._gather_ints(mine + [spare >> 20])
+         odd = [r for r, row in enumerate(rows) if row[:-1] != rows[0][:-1]]
+@@ -962,7 +995,7 @@ class GlmEngine:
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, "
+                                "TF_GLM_MULTI_GRAPHS, TF_GLM_MULTI_DRAFT_GRAPHS, "
+                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_DISK_CACHE, TF_GLM_CP_RAW_Q, "
+-                               "TF_GLM_CP_PARTS_EDGE, TF_GLM_CP_KV_GATHER): "
++                               "TF_GLM_CP_PARTS_EDGE, TF_GLM_CP_KV_GATHER, TF_GLM_CP_POOL_TOKENS): "
+                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
+                                "every rank the same flags")
+@@ -991,8 +1024,11 @@ class GlmEngine:
+                     from .dspark import DSparkConfig, memory
+ 
+                     kept_window = memory(DSparkConfig.read(Path(drafter)), rank, world)["kv"]
+-                pool_rows, each = full_pool_rows(capacity, parallel, self.cache_bytes - entries * kept_window,
+-                                                 full_token_bytes(text, kv, self.mtp_on), ALIGN)
++                if self.cp_pool_tokens:
++                    pool_rows = each = self.cp_pool_tokens
++                else:
++                    pool_rows, each = full_pool_rows(capacity, parallel, self.cache_bytes - entries * kept_window,
++                                                     -(-full_token_bytes(text, kv, self.mtp_on) // self.cp), ALIGN)
+                 if each < ALIGN:
+                     raise ValueError(f"--parallel {parallel}: a pool of {pool_rows} tokens leaves a stream less than "
+                                      f"one {ALIGN}-token extent; free memory, lower --context or --parallel")
+@@ -1036,7 +1072,7 @@ class GlmEngine:
+             w.meta["cp"] = self.cp
+             w.meta["cp_heads"] = max(split_sizes(int(cfg.heads), world, 1))
+             # TF_GLM_CP_GRAPHS=1: captured decode windows (off by default: a long-context window hung, being debugged)
+-            if os.environ.get("TF_GLM_CP_GRAPHS", "0") == "0":
++            if parallel > 1 or os.environ.get("TF_GLM_CP_GRAPHS", "0") == "0":
+                 graphs = False
+             if rank == 0:
+                 print(f"[tensorfold] context parallelism: each of the {world} ranks keeps every {world}th token's "
+@@ -1181,6 +1217,9 @@ class GlmEngine:
+                 if self.multi.row_ms is not None:
+                     print("[tensorfold] --parallel batched window ms by rows: " +
+                           " ".join(f"{i + 1}:{ms:.1f}" for i, ms in enumerate(self.multi.row_ms)), flush=True)
++        from .memory_receipt import receipt
++
++        receipt(self, "ready")
+         if hasattr(self.comm, "settle"):                # startup is over: RoCE gathers go without a barrier first
+             self.comm.settle()
+ 
+@@ -1560,6 +1599,8 @@ class GlmEngine:
+         length of the saved prefix rank 0 found on disk (``_disk_candidate``; 0: none), which every rank loads only
+         when all of them have a sound file of it (``_disk_resume``)."""
+ 
++        from .memory_receipt import requested_receipt
++        requested_receipt(self)
+         self.e.constraint, self.e.window = constraint, None       # both ranks walk and mask the same rows
+         try:
+             loaded = None
+diff --git a/src/tensorfold/families/glm5_next/cuda/forward.py b/src/tensorfold/families/glm5_next/cuda/forward.py
+index a2fdbb27..f0f97a8a 100644
+--- a/src/tensorfold/families/glm5_next/cuda/forward.py
++++ b/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -316,8 +316,8 @@ class Caches:
+     def bind(self, st: "State", base: int, size: int) -> None:
+         """Point ``st``'s caches at tokens [base, base + size) of the pool."""
+ 
+-        if self.cp > 1 and base:
+-            raise ValueError("context parallelism keeps one extent at base 0 (--parallel 1)")
++        if self.cp > 1 and base % self.cp:
++            raise ValueError("context-parallel extents must align to the CP rank count")
+         view = lambda i: None if i is None else self.arena.view(i, base, size)     # noqa: E731
+         st.kc = [view(i) for i in self.kc]
+         st.vc = [view(i) for i in self.vc]
+@@ -941,7 +941,7 @@ PROMPT_SPARSE_ROWS = 512   # full GLM-5.3: a prompt chunk's rows a sparse attent
+ 
+ 
+ def dsa_full_cp(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
+-                R: int, keys: torch.Tensor | None, host_pos: int | None, sparse_np: int | None) -> torch.Tensor:
++                R: int, keys: torch.Tensor | None, host_pos: int | None, sparse_np: int | None, *, lo: int = 0, rows_only: bool = False):
+     """dsa_full_block under context parallelism (TF_GLM_CP; ``dcp``, work/DCP-DESIGN.md): the rank's caches hold the
+     positions p with p % cp == rank (rows p // cp); every row takes the selection path (a row that sees k tokens or
+     fewer keeps them all): on a full layer each rank scores its own tokens, the ranks' candidates are gathered and
+@@ -957,16 +957,20 @@ def dsa_full_cp(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, p
+     G, rank = int(w.meta["cp"]), int(w.rank)
+     l0 = c.q_lora + c.kv_lora
+     freq = w.meta["rope_freq"]
+-    dsa_full_front(layer, w, b, 0, R)
++    rs = slice(lo, lo + R)
++    if not rows_only:
++        dsa_full_front(layer, w, b, 0, R)
++    elif b.prefill:
++        raise ValueError("CP rows_only is decode-only")
+     with prof.timed("dsa: latent write"):
+-        latent.latent_write(b.lat[:R], lc, pos_dev, cp=G, rank=rank)
+-        dsa_full.k_rope_write(b.dp[:R, l0:], kr, pos_dev, freq, cp=G, rank=rank, latent=lc)
+-    qp = dsa_full.q_rope(b.q[:R], b.qp[:R], pos_dev, freq, c.nope)
++        latent.latent_write(b.lat[rs], lc, pos_dev, cp=G, rank=rank)
++        dsa_full.k_rope_write(b.dp[rs, l0:], kr, pos_dev, freq, cp=G, rank=rank, latent=lc)
++    qp = dsa_full.q_rope(b.q[rs], b.qp[rs], pos_dev, freq, c.nope)
+     ix = a.index
+     if ix is not None and keys is not None:
+         with prof.timed("dsa: indexer update"):
+-            mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ikr[:R])
+-            dsa_full.index_write(b.ikr[:R, :c.index_dim], ix.ln_w, ix.ln_b, keys, pos_dev, freq, cp=G, rank=rank)
++            mm(b, b.normed[rs], ix.kw, b.xs[rs], b.ikr[rs])
++            dsa_full.index_write(b.ikr[rs, :c.index_dim], ix.ln_w, ix.ln_b, keys, pos_dev, freq, cp=G, rank=rank)
+     # every row sees at most the top-k tokens (a window within the dense limit): the selection keeps them all,
+     # ascending, so a rank's list is all its visible local slots (what select_merge gives): no scores, candidates
+     # or gather. Index keys are still written for later sparse rows.
+@@ -981,8 +985,8 @@ def dsa_full_cp(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, p
+             b.topk = cp_all_visible(w, b, R, pos_dev, G, rank, c.index_topk)
+     elif ix is not None and keys is not None:
+         with prof.timed("dsa: select tokens"):
+-            mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
+-            dsa_full.index_q_rope(b.qi[:R], c.index_heads, pos_dev, freq)
++            mm(b, b.qr[rs], ix.qb, b.xs_qr[rs], b.qi[rs])
++            dsa_full.index_q_rope(b.qi[rs], c.index_heads, pos_dev, freq)
+             if host_pos is not None:              # the visible local columns of the window's last row
+                 cols = max(1, dcp.visible_local(host_pos + R - 1, rank, G))
+             elif sparse_np is not None:           # a captured decode window's token bucket, a rank's share of it
+@@ -990,7 +994,7 @@ def dsa_full_cp(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, p
+             else:                                 # a captured window within the dense limit: its local slots
+                 cols = min(keys.shape[0], -(-int(c.dense_limit) // G) + 1)
+             sc = cp_scratch(w, b, keys) if not b.prefill else None
+-            cand = dcp.select_local(b.qi[:R], b.ikr[:R, c.index_dim:], keys, rank, G, pos_dev, R, k=c.index_topk,
++            cand = dcp.select_local(b.qi[rs], b.ikr[rs, c.index_dim:], keys, rank, G, pos_dev, R, k=c.index_topk,
+                                     cols=cols, out=sc.cand[:R] if sc else None, buf=sc.sel if sc else None)
+             every = (sc.every[:G * R * c.index_topk] if sc else
+                      torch.empty((G * R * c.index_topk,), dtype=torch.int64, device=cand.device))
+@@ -1001,8 +1005,8 @@ def dsa_full_cp(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, p
+         raise RuntimeError(f"layer {layer.index}: a shared indexer layer without a full layer's top-k before it")
+     s = b.lat_s
+     with prof.timed("dsa: absorb"):
+-        qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R], prompt=b.prefill and latent.PROMPT_MMA)
+-    ol = s.ol[:R]
++        qa = latent.absorb_q(b.q[rs], a.absorb, s.qa[rs], prompt=b.prefill and latent.PROMPT_MMA)
++    ol = s.ol[rs]
+     scale = c.qk_dim ** -0.5
+     tokens, counts = b.topk
+     HP = int(w.meta["cp_heads"])                      # heads a rank pads to (the largest share)
+@@ -1077,6 +1081,9 @@ def dsa_full_cp(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, p
+                                      sc.got_f[:G * n * HP * LW].view(G, n, HP, LW).copy_(got_o), got_l,
+                                      out=sc.merged[:n] if sc else None)
+             ol[r0:r1].copy_(merged[:, :HL])
++    if rows_only:
++        # Selection scratch is reused by the next stream. Retain private lists through shared-index layers.
++        return tuple(t.clone() for t in b.topk)
+     with prof.timed("dsa: expand"):
+         o = latent.expand_v(ol, a.absorb, b.vn[:R], prompt=b.prefill and latent.PROMPT_MMA).view(R, HL * c.v_dim)
+     return out_proj(w, b, o, a.o, None if b.prefill else qmm.group_sums(o, b.xs_ao[:R]), R,
+@@ -1568,7 +1575,10 @@ def cp_scratch(w: Weights, b: Buffers, keys: torch.Tensor) -> CpScratch:
+     """``b``'s CpScratch, made at its first window (an eager warm-up, never inside a capture)."""
+ 
+     sc = getattr(b, "cp_scratch", None)
+-    if sc is None:
++    if sc is None or sc.sel.numel() < min(b.rows, 128) * keys.shape[0]:
++        # Extents grow and different streams have different lengths; never reuse undersized score storage.
++        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
++            raise RuntimeError("CP score scratch must be sized before graph capture")
+         sc = b.cp_scratch = CpScratch(w, b.rows, keys.shape[0], b.x.device)
+     return sc
+ # TF_GLM_MSA (default 1): prompt chunks' sparse attention through Mia's sparse attention kernel (FP8 caches, <= 24
+diff --git a/src/tensorfold/families/glm5_next/cuda/memory_receipt.py b/src/tensorfold/families/glm5_next/cuda/memory_receipt.py
+new file mode 100644
+index 00000000..7d216459
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/memory_receipt.py
+@@ -0,0 +1,128 @@
++"""Opt-in physical-storage receipt; alias views and shared weights are counted once."""
++from __future__ import annotations
++import json
++import os
++import signal
++import threading
++from collections import defaultdict
++import torch
++
++
++_requested = False
++_installed = False
++MEMORY_SIGNAL = signal.SIGUSR2  # SIGUSR1 belongs to server.stacks / faulthandler.
++
++
++def _request(signum, frame):
++    # Signal handlers only publish a flag. CUDA work runs on the engine thread.
++    global _requested
++    _requested = True
++
++
++def requested_receipt(engine):
++    global _requested
++    if _requested:
++        _requested = False
++        receipt(engine, "requested")
++
++
++
++def _install_handler():
++    global _installed
++    if threading.current_thread() is threading.main_thread():
++        signal.signal(MEMORY_SIGNAL, _request)
++        _installed = True
++
++
++def receipt(engine, stage):
++    if os.environ.get('TF_GLM_MEMORY_RECEIPT', '0') != '1':
++        return
++    if stage == 'ready':
++        _install_handler()
++    torch.cuda.synchronize()
++    seen_objects, seen_storage = set(), set()
++    totals = defaultdict(int)
++    def walk(obj, category, path=''):
++        if isinstance(obj, torch.Tensor):
++            if obj.device.type != 'cuda':
++                return
++            storage = obj.untyped_storage()
++            key = (obj.device.index, storage.data_ptr())
++            if key not in seen_storage:
++                seen_storage.add(key)
++                totals[category] += storage.nbytes()
++            return
++        if obj is None or isinstance(obj, (str, bytes, int, float, bool, type)):
++            return
++        if id(obj) in seen_objects:
++            return
++        seen_objects.add(id(obj))
++        if isinstance(obj, dict):
++            items = obj.items()
++        elif isinstance(obj, (tuple, list)):
++            items = enumerate(obj)
++        elif type(obj).__module__.startswith('tensorfold.') and hasattr(obj, '__dict__'):
++            items = vars(obj).items()
++        else:
++            return
++        for name, val in items:
++            # Communications own external storage and process state; CUDA allocator reconciliation below covers it.
++            if name in ('comm', 'torch', 'scheduler', 'request'):
++                continue
++            walk(val, category, f'{path}.{name}')
++    w = engine.w
++    walk(w.mtp, 'weights_mtp')
++    for name in ('embed', 'embedding', 'head'):
++        walk(getattr(w, name, None), 'weights_embedding_head')
++    for layer in w.layers:
++        moe = getattr(layer, 'moe', None)
++        walk(getattr(moe, 'experts', None), 'weights_experts')
++        walk(getattr(getattr(layer, 'dsa', None), 'cp_absorb', None), 'weights_cp_absorb_replicas')
++    walk(w, 'weights_dense_and_norms')
++    e = engine.e
++    walk(e.caches, 'kv_pool')
++    walk(engine.drafter, 'drafter')
++    walk(e.pbuf, 'prompt_chunk_buffers')
++    walk(e.buf, 'decode_buffers')
++    walk(e.mbuf, 'mtp_buffers')
++    walk(getattr(engine, 'multi', None), 'multi_buffers_and_drafter_contexts')
++    walk(e.graphs, 'graph_referenced_storage')
++    walk(engine, 'other_referenced_storage')
++    allocated, reserved = torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
++    free, total = torch.cuda.mem_get_info()
++    pool_ids = set()
++    for handle in (getattr(e.graphs, 'pool', None),
++                   getattr(getattr(engine, 'multi', None), 'graph_pool', None)):
++        if handle is not None:
++            pool_ids.add(tuple(handle))
++    pools = {}
++    for segment in torch.cuda.memory_snapshot():
++        if segment.get('device', torch.cuda.current_device()) != torch.cuda.current_device():
++            continue
++        key = tuple(segment.get('segment_pool_id', (0, 0)))
++        row = pools.setdefault(key, dict(id=list(key), reserved_bytes=0, allocated_bytes=0,
++                                         recognized_graph_pool=key in pool_ids))
++        row['reserved_bytes'] += segment['total_size']
++        row['allocated_bytes'] += segment['allocated_size']
++    stats = torch.cuda.memory_stats()
++    result = dict(signal_dump_available=_installed and signal.getsignal(MEMORY_SIGNAL) is _request,
++                  signal_dump_number=int(MEMORY_SIGNAL), signal_dump_name=MEMORY_SIGNAL.name,
++                  pid=os.getpid(), parallel=engine.parallel,
++                  pool_tokens=e.caches.arena.rows, dense=os.environ.get('TF_GLM_DENSE'),
++                  allocator_pools=list(pools.values()),
++                  graph_pool_reserved_bytes=sum(v['reserved_bytes'] for k,v in pools.items() if k in pool_ids),
++                  other_private_pool_reserved_bytes=sum(v['reserved_bytes'] for k,v in pools.items() if k != (0,0) and k not in pool_ids),
++                  peak_allocated_bytes=torch.cuda.max_memory_allocated(),
++                  peak_reserved_bytes=torch.cuda.max_memory_reserved(),
++                  inactive_split_bytes=stats.get('inactive_split_bytes.all.current'),
++                  event='cp_memory_receipt', stage=stage, rank=w.rank,
++                  cp=engine.cp, context=engine.limit, kv=engine.kv,
++                  categories_bytes=dict(totals), counted_storage_bytes=sum(totals.values()),
++                  allocated_bytes=allocated, reserved_bytes=reserved,
++                  allocator_slack_bytes=reserved-allocated,
++                  allocator_unattributed_bytes=allocated-sum(totals.values()),
++                  cuda_used_bytes=total-free, cuda_outside_allocator_bytes=total-free-reserved,
++                  free_bytes=free, total_bytes=total,
++                  note='Graph executable/driver/NCCL bytes remain outside allocator; no fabricated split.')
++    print(json.dumps(result, sort_keys=True), flush=True)
++    return result
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi.py b/src/tensorfold/families/glm5_next/cuda/multi.py
+index ea441501..42d68cd9 100644
+--- a/src/tensorfold/families/glm5_next/cuda/multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/multi.py
+@@ -316,7 +316,8 @@ def verify_kind(value: str | None = None, *, full: bool = False) -> str:
+ 
+     value = (os.environ.get("TF_GLM_MULTI_VERIFY", "") if value is None else value).strip().lower()
+     if full:
+-        value = "seg" if value in ("", "batched") else value
++        value = ("segments" if os.environ.get("TF_GLM_CP_MULTI", "0") == "1" and
++                 os.environ.get("TF_GLM_CP", "0") == "1" else "seg") if value in ("", "batched") else value
+         if value not in ("seg", "segments", "serial"):
+             raise ValueError(f"TF_GLM_MULTI_VERIFY (full GLM-5.3): seg, segments or serial, not {value!r}")
+         return value
+@@ -462,8 +463,8 @@ class MultiDecoder:
+         # (``full_seg.FullSegVerify``, CUDA graphs a window shape; at most FULL_MAX_ROWS rows a round, every stream's)
+         self.full = bool(self.w.cfg.full)
+         self.window_rows = FULL_MAX_ROWS if self.full else MAX_WINDOW
+-        if self.full and int(self.w.meta.get("cp", 1)) > 1:
+-            raise ValueError("context parallelism (TF_GLM_CP=1) serves one request at a time: --parallel 1")
++        if self.full and int(self.w.meta.get("cp", 1)) > 1 and self.group:
++            raise ValueError("concurrent CP uses independent prompt chunks: TF_GLM_MULTI_PREFILL=0")
+         self.drafts = drafts
+         # full GLM-5.3's CUDA graphs (the DSpark contexts', the batched verify's) share one pool: the engine's graphs'
+         # (nothing replays two at once); TF_GLM_MULTI_GRAPHS / TF_GLM_MULTI_DRAFT_GRAPHS=0: eager (the same bits)
+@@ -1139,6 +1140,8 @@ class MultiDecoder:
+     def round(self) -> list[Stream]:
+         """Rank 0: one prompt chunk or one decode round; returns the streams that finished."""
+ 
++        from .memory_receipt import requested_receipt
++        requested_receipt(self.g)
+         self._check()
+         _watch(self.watchdog, "iteration")               # cancelled at the end of ``finish``
+         self.iteration_since = time.monotonic()           # /health's iteration_s
+@@ -1765,6 +1768,8 @@ class MultiDecoder:
+ 
+         from tensorfold.engine.exact_sampling import Sampling  # noqa: F401
+ 
++        from .memory_receipt import requested_receipt
++        requested_receipt(self.g)
+         for op, p in self.parse(msg):
+             if op == ADMIT:
+                 a = self._parse_admit(p)
+diff --git a/src/tensorfold/families/glm5_next/cuda/verify.py b/src/tensorfold/families/glm5_next/cuda/verify.py
+index b22192b6..a7d85e80 100644
+--- a/src/tensorfold/families/glm5_next/cuda/verify.py
++++ b/src/tensorfold/families/glm5_next/cuda/verify.py
+@@ -322,8 +322,7 @@ class FullBatchedVerify:
+         c = w.cfg
+         if not c.full:
+             raise ValueError("FullBatchedVerify is full GLM-5.3's (GLM-5.3-Flash: BatchedVerify)")
+-        if int(w.meta.get("cp", 1)) > 1:
+-            raise ValueError("context parallelism serves one stream (its caches keep one extent at base 0)")
++        self.cp = int(w.meta.get("cp", 1))
+         if not latent.ENABLED:
+             raise ValueError("batched verify windows need the latent cache (TF_GLM_LATENT=1)")
+         if not 1 <= rows <= FULL_MAX_ROWS:
+@@ -409,9 +408,16 @@ class FullBatchedVerify:
+                     keys = st.index[st.index_of[layer.index]][2]
+                 # the lone window's arguments: its rows, its chunk count, its host position (dense / sparse rows,
+                 # the selection's token bucket over its own extent)
+-                self.topk[k] = dsa_full_rows(layer, w, st.kc[di], st.kr[di], st.pos_dev, b, n, chunks_for(st, n),
+-                                             keys, st.pos, None, indexed=st.index is not None, topk=self.topk[k],
+-                                             lo=at)
++                if self.cp > 1:
++                    from .forward import dsa_full_cp
++
++                    b.topk = self.topk[k]
++                    self.topk[k] = dsa_full_cp(layer, w, st.kc[di], st.kr[di], st.pos_dev, b, n,
++                                               keys, st.pos, None, lo=at, rows_only=True)
++                else:
++                    self.topk[k] = dsa_full_rows(layer, w, st.kc[di], st.kr[di], st.pos_dev, b, n, chunks_for(st, n),
++                                                 keys, st.pos, None, indexed=st.index is not None, topk=self.topk[k],
++                                                 lo=at)
+                 at += n
+             return dsa_full_out(layer, w, b, R)
+ 
