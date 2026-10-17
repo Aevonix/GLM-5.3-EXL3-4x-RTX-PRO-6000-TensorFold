@@ -1,6 +1,6 @@
 # Patches
 
-The image applies 151 engine patches to TensorFold v0.6.6 (`cb2ebf0540f42604e2759b2ddef497861e928248`) in the
+The image applies 152 engine patches to TensorFold v0.6.6 (`cb2ebf0540f42604e2759b2ddef497861e928248`) in the
 order of [`patches/series.json`](../patches/series.json), which is not filename order, and 4 build patches to the
 Docker build context in the order of [`patches/recipe-series.json`](../patches/recipe-series.json). Both manifests
 pin every file's SHA256. `scripts/apply-patches.sh` refuses fuzz, offsets, rejects and checksum drift, and
@@ -10,7 +10,7 @@ The [v0.6.6 rebase notes](PORT-v0.6.6.md) record the 10 regenerated patches and 
 | Folder | Patches | Origin |
 |---|---:|---|
 | `patches/miaai-lab/` | 106 | Mia's AI Lab's full GLM-5.3 recipe, originally ported from TensorFold v0.6.0 to v0.6.5 ([port notes](PORT-v0.6.5.md)), then [rebased to v0.6.6](PORT-v0.6.6.md) |
-| `patches/aevonix/` | 45 | Aevonix Research: single-host serving, concurrent context-parallel sessions, kernels and prompt-cache tiers |
+| `patches/aevonix/` | 46 | Aevonix Research: single-host serving, concurrent context-parallel sessions, kernels and prompt-cache tiers |
 | `patches/build/` | 4 | Aevonix Research: image packaging and runtime pins |
 
 **Exactness boundary.** FP8 dense layers and FP8 KV change numerics relative to the checkpoint's BF16 tensors.
@@ -58,6 +58,7 @@ or by `serve.sh`.
 | `aevonix-mia-280-vllm-metric-names` | none | Adds `vllm:num_requests_running`, `vllm:num_requests_waiting` and `vllm:kv_cache_usage_perc` with the same values as the TensorFold gauges. | Metrics only; the real `/metrics` routes pass. |
 | `aevonix-mia-221` and `-223` | `TF_GLM_CP_VECTOR_MERGE`, `TF_GLM_CP_MERGE_EARLY_EXIT` | A resident integer candidate vector and an exact radix early exit for the context-parallel merge (TP4, top-k 2048, at most 16 rows). | Populated CP=1 decode +2.9%, +2.6% and +2.7% at 262,144, 524,288 and 1,048,112 prompt tokens on the qualification donor; CP=0 within 0.3%. *Exact*. |
 | `aevonix-mia-235` and `-236` | `TF_GLM_MSA_HALF_HEADS`, `TF_GLM_MSA_SKIP_EMPTY_QK` | Omit unused output and QK head tiles in FP8 prompt attention with at most 16 local heads. | Cold prefill +3.0% to +4.0% (CP=1) and +2.4% to +3.5% (CP=0) on the donor; short decode within 0.3%. *Exact*: live-head accumulation order is unchanged. |
+| `aevonix-mia-237-msa2-two-rows-per-sm` | `TF_GLM_MSA2` | A leaner FP8 prompt-attention kernel for at most 16 local heads with bf16 rotary keys: four warps a row instead of eight (the 235/236 kernel's active QK warps, 128 output columns a warp), the queries' mma fragments held in registers for the whole row and the next key tile prefetched into registers instead of a shared-memory staging area. 43 KB of shared memory instead of 99 KB, so two rows share an SM and one row's barriers overlap the other's arithmetic. Tiles, mma chains and the softmax order are unchanged. | Kernel 1.66x on a full 3,072-row chunk (`tools/check_msa2.py`) and 1.40x a chunk in the engine; cold time to first token -6.1% at 62K and -5.2% at 131K, a contributed measurement on four RTX PRO 6000 Blackwell Workstation GPUs at a 350 W limit with every other setting held constant. *Exact*: `tools/check_msa2.py` compares 16, 12 and 8 local heads, `prompt` and `prompt_lse` and token counts from 0 to 2,048 byte for byte; six fixed greedy prompts and 24 prompts' first-token logits matched in the engine. |
 
 Not adopted: an optional earlier host cache and IPC collectives, and the screened kernel experiments that regressed
 or gained under 1%.

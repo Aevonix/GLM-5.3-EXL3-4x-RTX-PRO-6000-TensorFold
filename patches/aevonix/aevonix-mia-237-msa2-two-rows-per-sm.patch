@@ -1,0 +1,320 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/msa.cu b/src/tensorfold/families/glm5_next/cuda/msa.cu
+index 8ca0cca4..0bbab33e 100644
+--- a/src/tensorfold/families/glm5_next/cuda/msa.cu
++++ b/src/tensorfold/families/glm5_next/cuda/msa.cu
+@@ -17,6 +17,7 @@
+ // dequantize step writes code times scale as bf16 (exact) into the key tile's rotary columns, the same values the
+ // Triton kernels' _rope_tile gives; nothing else changes.
+ 
++#include <cstdlib>
+ #include <cuda_bf16.h>
+ #include <cuda_fp16.h>
+ #include <cuda_fp8.h>
+@@ -470,6 +471,280 @@ __global__ void __launch_bounds__(NTHREADS, 1) msa_kernel(
+     }
+ }
+ 
++
++// msa2_kernel (TF_GLM_MSA2=1): msa_kernel<false, false, false, 1> built with MSA_HALF_HEADS and
++// MSA_SKIP_EMPTY_QK (an FP8 latent cache, bf16 rotary keys, at most 16 heads a rank), every value computed by the same
++// operations in the same order, so the same bits, in a leaner block: 4 warps a row (the active QK warps of the
++// original: key pair np, K half kh), the queries' mma A fragments in registers for the whole row (no per-tile ldmatrix
++// of Q), the next tile's cache rows and rotary keys loaded into registers while the current tile computes (no staging
++// area), 128 output columns a warp in the PV product. ~43 KB of shared memory: two rows share an SM, so one row's
++// barriers overlap the other's arithmetic (the original held one 8-warp row an SM, 99 KB).
++constexpr int NW2 = 4;
++constexpr int NT2 = NW2 * 32;
++constexpr size_t S2_K = 0;                                      // [KT][KS] bf16 key tile (latent | rope)
++constexpr size_t S2_P = S2_K + (size_t)KT * KS * 2;             // [16][PS] P^T bf16 (heads x keys)
++constexpr size_t S2_KS = S2_P + (size_t)16 * PS * 2;            // [KT] key scales (fp32)
++constexpr size_t S2_RED = S2_KS + (size_t)KT * 4;               // [16][4] per (head, key pair) partials
++constexpr size_t S2_ST = S2_RED + (size_t)16 * 4 * 4;           // [16] m, [16] l, [16] alpha
++constexpr size_t S2_X = S2_ST + (size_t)3 * 16 * 4;             // [2 key pairs][32 lanes][16] K half 1's partial scores
++constexpr size_t SMEM2 = S2_X + (size_t)2 * 32 * 16 * 4;
++
++__global__ void __launch_bounds__(NT2, 2) msa2_kernel(
++    const __nv_bfloat16* __restrict__ qa, const __nv_bfloat16* __restrict__ qp, const uint8_t* __restrict__ cache,
++    const __nv_bfloat16* __restrict__ rope, const int* __restrict__ tokens, const int* __restrict__ counts,
++    __nv_bfloat16* __restrict__ out, float* __restrict__ lse, int H, int W, float scale) {
++    extern __shared__ __align__(16) unsigned char smem[];
++    const int r = blockIdx.x;
++    const int n = counts[r];
++    if (n <= 0) {                                       // lse (context parallelism): no local tokens, o 0, lse -inf
++        if (lse != nullptr) {
++            for (int i = threadIdx.x; i < H * LW / 2; i += NT2)
++                reinterpret_cast<__nv_bfloat162*>(out + (size_t)r * H * LW)[i] = __floats2bfloat162_rn(0.f, 0.f);
++            if (threadIdx.x < H) lse[(size_t)r * H + threadIdx.x] = -INFINITY;
++        }
++        return;
++    }
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
++    __nv_bfloat16* K = reinterpret_cast<__nv_bfloat16*>(smem + S2_K);
++    __nv_bfloat16* P = reinterpret_cast<__nv_bfloat16*>(smem + S2_P);
++    float* ksh = reinterpret_cast<float*>(smem + S2_KS);
++    float* red = reinterpret_cast<float*>(smem + S2_RED);
++    float* mst = reinterpret_cast<float*>(smem + S2_ST);
++    float* lst = mst + 16;
++    float* ast = mst + 32;
++    const int* toks = tokens + (size_t)r * W;
++    const int np = warp & 1, kh = warp >> 1;
++    float* X = reinterpret_cast<float*>(smem + S2_X) + ((size_t)np * 32 + lane) * 16;
++
++    // the queries' A fragments of this warp's k steps (latent 16 kh .. 16 kh + 15, rotary 32 + 2 kh, + 1): rows (heads)
++    // g, g + 8, columns 2t, 2t + 1 and + 8 of the step, as ldmatrix x4 of the original's Q tile gives them
++    uint32_t qf[18][4];
++#pragma unroll
++    for (int i = 0; i < 18; ++i) {
++        const int s = i < 16 ? 16 * kh + i : 32 + 2 * kh + (i - 16);
++#pragma unroll
++        for (int q = 0; q < 4; ++q) {
++            const int h = g + (q & 1) * 8;
++            const int d = 16 * s + 2 * t + (q >> 1) * 8;
++            uint32_t v = 0u;
++            if (h < H)
++                v = d < LW ? __ldg(reinterpret_cast<const unsigned int*>(qa + ((size_t)r * H + h) * LW + d))
++                           : __ldg(reinterpret_cast<const unsigned int*>(qp + ((size_t)r * H + h) * RD + (d - LW)));
++            qf[i][q] = v;
++        }
++    }
++    if (threadIdx.x < 16) {
++        mst[threadIdx.x] = -INFINITY;
++        lst[threadIdx.x] = 0.f;
++    }
++    float o[16][4];
++#pragma unroll
++    for (int b = 0; b < 16; ++b)
++#pragma unroll
++        for (int c = 0; c < 4; ++c) o[b][c] = 0.f;
++
++    // the prefetch: thread (key pk, quarter pp) holds its key's codes pp * 128 .., rotary values 16 pp .. and (pp 0)
++    // the row's scale; keys past the list are zero (the original's zero-filled staging)
++    const int pk = threadIdx.x >> 2, pp = threadIdx.x & 3;
++    uint4 lat[8], rp[2];
++    float kscale = 0.f;
++    auto fetch = [&](int t0) {
++        const int i = t0 + pk;
++        if (i < n) {
++            const long long tk = __ldg(toks + i);
++            const uint4* s4 = reinterpret_cast<const uint4*>(cache + tk * CROW + pp * 128);
++#pragma unroll
++            for (int v = 0; v < 8; ++v) lat[v] = __ldg(s4 + v);
++            const uint4* r4 = reinterpret_cast<const uint4*>(rope + tk * RD + pp * 16);
++            rp[0] = __ldg(r4);
++            rp[1] = __ldg(r4 + 1);
++            kscale = pp == 0 ? __ldg(reinterpret_cast<const float*>(cache + tk * CROW + LW)) : 0.f;
++        } else {
++#pragma unroll
++            for (int v = 0; v < 8; ++v) lat[v] = make_uint4(0u, 0u, 0u, 0u);
++            rp[0] = rp[1] = make_uint4(0u, 0u, 0u, 0u);
++            kscale = 0.f;
++        }
++    };
++    const __nv_bfloat16* bbase = K + (size_t)(np * 16 + (lane & 7) + ((lane >> 4) & 1) * 8) * KS + ((lane >> 3) & 1) * 8;
++    const int h0 = g, h1 = g + 8;
++
++    fetch(0);
++    for (int t0 = 0; t0 < n; t0 += KT) {
++        __syncthreads();                         // the previous tile's readers of K, P, ksh and X are done
++        {                                        // dequantize this tile into K (codes to bf16, exact), its scales
++            __nv_bfloat16* dst = K + (size_t)pk * KS + pp * 128;
++#pragma unroll
++            for (int v = 0; v < 8; ++v) {
++                const uint32_t w[4] = {lat[v].x, lat[v].y, lat[v].z, lat[v].w};
++                uint32_t b[8];
++#pragma unroll
++                for (int j = 0; j < 4; ++j) {
++                    b[2 * j] = e4m3x2_bf16x2((uint16_t)(w[j] & 0xffffu));
++                    b[2 * j + 1] = e4m3x2_bf16x2((uint16_t)(w[j] >> 16));
++                }
++                *reinterpret_cast<uint4*>(dst + v * 16) = make_uint4(b[0], b[1], b[2], b[3]);
++                *reinterpret_cast<uint4*>(dst + v * 16 + 8) = make_uint4(b[4], b[5], b[6], b[7]);
++            }
++            *reinterpret_cast<uint4*>(K + (size_t)pk * KS + LW + pp * 16) = rp[0];
++            *reinterpret_cast<uint4*>(K + (size_t)pk * KS + LW + pp * 16 + 8) = rp[1];
++            if (pp == 0) ksh[pk] = kscale;
++        }
++        if (t0 + KT < n) fetch(t0 + KT);         // the next tile's rows on their way while this one computes
++        __syncthreads();                         // the key tile is ready
++
++        // scores^T: heads 0 .. 15, keys 16 np .. (n tiles j = 0, 1), K half kh; the original's chains: latent k steps
++        // 16 kh + c, + 2, .. (c = 0, 1) two chains an n tile, rotary steps 32 + 2 kh, + 1 one chain
++        float part[16];
++        {
++            float acc[2][2][4] = {}, accr[2][4] = {};
++#pragma unroll
++            for (int i = 0; i < 16; i += 2) {
++#pragma unroll
++                for (int c = 0; c < 2; ++c) {
++                    uint32_t bb[4];
++                    ldsm_x4(bb, bbase + (16 * kh + i + c) * 16);
++                    const uint32_t b0[2] = {bb[0], bb[1]}, b1[2] = {bb[2], bb[3]};
++                    mma_bf16(acc[0][c], qf[i + c], b0);
++                    mma_bf16(acc[1][c], qf[i + c], b1);
++                }
++            }
++#pragma unroll
++            for (int i = 16; i < 18; ++i) {
++                uint32_t bb[4];
++                ldsm_x4(bb, bbase + (32 + 2 * kh + (i - 16)) * 16);
++                const uint32_t b0[2] = {bb[0], bb[1]}, b1[2] = {bb[2], bb[3]};
++                mma_bf16(accr[0], qf[i], b0);
++                mma_bf16(accr[1], qf[i], b1);
++            }
++#pragma unroll
++            for (int j = 0; j < 2; ++j)
++#pragma unroll
++                for (int q = 0; q < 4; ++q) {
++                    part[j * 8 + q] = acc[j][0][q] + acc[j][1][q];
++                    part[j * 8 + 4 + q] = accr[j][q];
++                }
++            if (kh == 1)
++#pragma unroll
++                for (int q = 0; q < 16; q += 4)
++                    *reinterpret_cast<float4*>(X + q) = make_float4(part[q], part[q + 1], part[q + 2], part[q + 3]);
++        }
++        __syncthreads();
++        float sc[2][4], ksv[2][2];
++        bool okv[2][2];
++        if (kh == 0) {
++#pragma unroll
++            for (int q = 0; q < 16; q += 4) {
++                const float4 o4 = *reinterpret_cast<const float4*>(X + q);
++                part[q] += o4.x; part[q + 1] += o4.y; part[q + 2] += o4.z; part[q + 3] += o4.w;
++            }
++            float mx0 = -INFINITY, mx1 = -INFINITY;
++#pragma unroll
++            for (int j = 0; j < 2; ++j) {
++                const int k0 = np * 16 + j * 8 + 2 * t;
++                okv[j][0] = t0 + k0 < n;
++                okv[j][1] = t0 + k0 + 1 < n;
++                ksv[j][0] = ksh[k0];
++                ksv[j][1] = ksh[k0 + 1];
++#pragma unroll
++                for (int q = 0; q < 4; ++q) {
++                    const int e = q & 1;
++                    sc[j][q] = okv[j][e] ? (part[j * 8 + q] * ksv[j][e] + part[j * 8 + 4 + q]) * scale : -INFINITY;
++                }
++                mx0 = fmaxf(mx0, fmaxf(sc[j][0], sc[j][1]));
++                mx1 = fmaxf(mx1, fmaxf(sc[j][2], sc[j][3]));
++            }
++#pragma unroll
++            for (int d = 1; d < 4; d <<= 1) {
++                mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, d));
++                mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, d));
++            }
++            if (t == 0) {
++                red[h0 * 4 + np] = mx0;
++                red[h1 * 4 + np] = mx1;
++            }
++        }
++        __syncthreads();
++        if (threadIdx.x < 16) {
++            const int h = threadIdx.x;
++            const float tm = fmaxf(red[h * 4], red[h * 4 + 1]);
++            const float m = mst[h];
++            const bool active = tm != -INFINITY;
++            const float nm = active ? fmaxf(m, tm) : m;
++            ast[h] = active ? (m == -INFINITY ? 0.f : __expf(m - nm)) : 1.f;
++            mst[h] = nm;
++        }
++        __syncthreads();
++        if (kh == 0) {
++            const float m0 = mst[h0], m1 = mst[h1];
++            float q0 = 0.f, q1 = 0.f;
++#pragma unroll
++            for (int j = 0; j < 2; ++j) {
++                const int k0 = np * 16 + j * 8 + 2 * t;
++                const float p0 = okv[j][0] && m0 != -INFINITY ? __expf(sc[j][0] - m0) : 0.f;
++                const float p1 = okv[j][1] && m0 != -INFINITY ? __expf(sc[j][1] - m0) : 0.f;
++                const float p2 = okv[j][0] && m1 != -INFINITY ? __expf(sc[j][2] - m1) : 0.f;
++                const float p3 = okv[j][1] && m1 != -INFINITY ? __expf(sc[j][3] - m1) : 0.f;
++                *reinterpret_cast<__nv_bfloat162*>(P + (size_t)h0 * PS + k0) =
++                    __floats2bfloat162_rn(p0 * ksv[j][0], p1 * ksv[j][1]);
++                *reinterpret_cast<__nv_bfloat162*>(P + (size_t)h1 * PS + k0) =
++                    __floats2bfloat162_rn(p2 * ksv[j][0], p3 * ksv[j][1]);
++                q0 += p0 + p1;
++                q1 += p2 + p3;
++            }
++#pragma unroll
++            for (int d = 1; d < 4; d <<= 1) {
++                q0 += __shfl_xor_sync(0xffffffffu, q0, d);
++                q1 += __shfl_xor_sync(0xffffffffu, q1, d);
++            }
++            if (t == 0) {
++                red[h0 * 4 + np] = q0;
++                red[h1 * 4 + np] = q1;
++            }
++        }
++        __syncthreads();
++        if (threadIdx.x < 16) {
++            const int h = threadIdx.x;
++            lst[h] = lst[h] * ast[h] + (red[h * 4] + red[h * 4 + 1]);
++        }
++        // O = O * alpha + P^T V: this warp's 128 columns (16 n tiles), the tile's 2 k steps of 16 keys
++        {
++            const float al0 = ast[g], al1 = ast[g + 8];
++#pragma unroll
++            for (int b = 0; b < 16; ++b) {
++                o[b][0] *= al0;
++                o[b][1] *= al0;
++                o[b][2] *= al1;
++                o[b][3] *= al1;
++            }
++#pragma unroll
++            for (int kk = 0; kk < KT / 16; ++kk) {
++                uint32_t pa[4];
++                ldsm_x4(pa, P + (size_t)(lane & 15) * PS + kk * 16 + (lane >> 4) * 8);
++#pragma unroll
++                for (int b = 0; b < 16; ++b) {
++                    uint32_t vb[2];
++                    ldsm_x2_t(vb, K + (size_t)(kk * 16 + (lane & 15)) * KS + warp * 128 + b * 8);
++                    mma_bf16(o[b], pa, vb);
++                }
++            }
++        }
++    }
++    __syncthreads();
++    if (lse != nullptr && threadIdx.x < H) lse[(size_t)r * H + threadIdx.x] = mst[threadIdx.x] + logf(lst[threadIdx.x]);
++    const float la = lst[h0], lb = lst[h1];
++#pragma unroll
++    for (int b = 0; b < 16; ++b) {
++        const int col = warp * 128 + b * 8 + 2 * t;
++        if (h0 < H)
++            *reinterpret_cast<__nv_bfloat162*>(out + ((size_t)r * H + h0) * LW + col) =
++                __floats2bfloat162_rn(o[b][0] / la, o[b][1] / la);
++        if (h1 < H)
++            *reinterpret_cast<__nv_bfloat162*>(out + ((size_t)r * H + h1) * LW + col) =
++                __floats2bfloat162_rn(o[b][2] / lb, o[b][3] / lb);
++    }
++}
++
+ }  // namespace
+ 
+ // TF_GLM_MSA_FP4_LUT=1 (msa.py): FP4 tiles dequantized through the constant table as before 0141 (the same bits)
+@@ -511,6 +786,26 @@ void msa_prompt_cuda(const at::Tensor& qa, const at::Tensor& qp, const at::Tenso
+     // only the unused second PV head tile is removed. FP4 keeps its path.
+     if (!fp4 && H <= 16) kernel = msa_kernel<false, false, false, 1>;
+ #endif
++    // TF_GLM_MSA2=1: msa2_kernel (the same bits as the HALF_HEADS / SKIP_EMPTY_QK variant) for FP8 caches
++    // with bf16 rotary keys and at most 16 heads a rank
++    static const bool use2 = [] {
++        const char* v = std::getenv("TF_GLM_MSA2");
++        return v != nullptr && v[0] == '1';
++    }();
++    if (use2 && !fp4 && !r8 && H <= 16) {
++        static bool once2 = [] {
++            C10_CUDA_CHECK(cudaFuncSetAttribute(msa2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM2));
++            return true;
++        }();
++        (void)once2;
++        msa2_kernel<<<R, NT2, SMEM2, at::cuda::getCurrentCUDAStream()>>>(
++            reinterpret_cast<const __nv_bfloat16*>(qa.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(qp.data_ptr()),
++            cache.data_ptr<uint8_t>(), reinterpret_cast<const __nv_bfloat16*>(rope.data_ptr()), tokens.data_ptr<int>(),
++            counts.data_ptr<int>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), lse, H, (int)tokens.size(1),
++            (float)scale);
++        C10_CUDA_KERNEL_LAUNCH_CHECK();
++        return;
++    }
+     kernel<<<R, NTHREADS, SMEM, at::cuda::getCurrentCUDAStream()>>>(
+         reinterpret_cast<const __nv_bfloat16*>(qa.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(qp.data_ptr()),
+         cache.data_ptr<uint8_t>(), reinterpret_cast<const unsigned char*>(rope.data_ptr()), tokens.data_ptr<int>(),

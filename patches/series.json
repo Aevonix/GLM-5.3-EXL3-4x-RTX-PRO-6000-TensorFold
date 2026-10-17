@@ -904,5 +904,11 @@
     "sha256": "18cfe7118a9c8d30568bc6d3a5d3aeddfae618f0377f24c7cd74947305e2c281",
     "strip": 1,
     "cwd": "."
+  },
+  {
+    "path": "aevonix/aevonix-mia-237-msa2-two-rows-per-sm.patch",
+    "sha256": "22138f692a01495b34faa4be8aef1b6182e15432d360471864d321eb62d7b69c",
+    "strip": 1,
+    "cwd": "."
   }
 ]
