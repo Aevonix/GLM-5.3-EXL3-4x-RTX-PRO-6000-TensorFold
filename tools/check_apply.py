@@ -20,7 +20,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TF_COMMIT = "cb2ebf0540f42604e2759b2ddef497861e928248"
-EXPECTED_TREE = "2bb0ccebc8b59248049d426a7d92e870010797c7"
+EXPECTED_TREE = "35d111aeee926cf35678e0ac0d48c100eec9d52d"
 EXPECTED_CONTEXT = {
     "Dockerfile": "44efad84585163a26e5fcefa76089fd67312474002bdb808371ff0dd45e050c0",
     ".dockerignore": "ed4cba8294c72a22f8353e6b5a08a926127d974ea5984a851e61335702ee819c",

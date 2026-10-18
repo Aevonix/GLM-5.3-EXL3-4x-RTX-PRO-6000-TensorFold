@@ -126,7 +126,7 @@ prepare_image() {
   local hash context
   hash=$(recipe_hash)
   if [[ "$DRY_RUN" != 1 ]] && image_ready; then log "Image is ready: $IMAGE ($hash)"; return; fi
-  log "Build $IMAGE: clone TensorFold $ENGINE_VERSION at $ENGINE_COMMIT, apply the 151 engine patches and 4 build patches strictly."
+  log "Build $IMAGE: clone TensorFold $ENGINE_VERSION at $ENGINE_COMMIT, apply the 152 engine patches and 4 build patches strictly."
   context="$STATE_DIR/build-$hash"
   if [[ "$DRY_RUN" == 1 ]]; then
     plan cp -a "$REPO_ROOT/build/recipe-base/." "$context/"

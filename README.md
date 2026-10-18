@@ -256,7 +256,7 @@ cd GLM-5.3-EXL3-4x-RTX-PRO-6000-TensorFold
 ./start.sh
 ```
 
-The first run checks the host, builds TensorFold at the pinned commit with all 151 engine patches, downloads the pinned
+The first run checks the host, builds TensorFold at the pinned commit with all 152 engine patches, downloads the pinned
 checkpoint and drafter, starts four ranks, waits for the API, sends a short greedy smoke request and prints
 `GLM-5.3 EXL3 is now LIVE! on port 8030` with the endpoint. The first start also compiles CUDA kernels into `CACHE_DIR`.
 Each start loads about 273 GiB of weights; qualification boots took 3.5 to 7.5 minutes from start to a ready API.
@@ -346,7 +346,7 @@ This checkpoint is text-only: the recipe serves no image or video input. For vis
 `./start.sh` shows each step as it runs:
 
 1. Check the settings, Linux, Docker, the NVIDIA runtime, GPUs 0 to 3, free disk space and the optional download token.
-2. Build the image from a fresh TensorFold v0.6.6 clone at the pinned commit: apply the 151 engine patches and the 4 build
+2. Build the image from a fresh TensorFold v0.6.6 clone at the pinned commit: apply the 152 engine patches and the 4 build
    patches with `scripts/apply-patches.sh`, which refuses fuzz, offsets and checksum drift, then build on the pinned
    NVIDIA base. A matching image is reused.
 3. Download the pinned checkpoint and DSpark and check that the checkpoint's `config.json` has the qualified SHA256.

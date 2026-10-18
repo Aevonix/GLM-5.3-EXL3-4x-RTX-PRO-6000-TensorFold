@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Added engine patch `aevonix-mia-237-msa2-two-rows-per-sm` (`TF_GLM_MSA2`): a leaner FP8 prompt-attention kernel
+  for at most 16 local heads that keeps two rows on an SM. Its outputs are byte-identical to the 235/236 kernel's
+  (`tools/check_msa2.py`). The kernel runs 1.66x faster on a full prompt chunk; cold time to first token improved
+  5% to 6% at 62K and 131K in a contributed measurement. The production profile enables it.
+- 152 engine patches; the replayed engine source tree is `35d111aeee926cf35678e0ac0d48c100eec9d52d`.
+
 ## 1.1.0 (2026-10-08)
 
 - Rebased the 151 engine patches onto TensorFold v0.6.6 at `cb2ebf0540f42604e2759b2ddef497861e928248`.

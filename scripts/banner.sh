@@ -24,7 +24,7 @@ _banner_plain() {
 _banner_short() {
   printf '%s\n' \
     'AEVONIX RESEARCH | GLM-5.3 EXL3' \
-    'TensorFold v0.6.6 + 151 patches | 4x RTX PRO 6000 | API :8030' \
+    'TensorFold v0.6.6 + 152 patches | 4x RTX PRO 6000 | API :8030' \
     "TensorFold by Ash Hart · In collaboration with Mia's AI Lab"
 }
 

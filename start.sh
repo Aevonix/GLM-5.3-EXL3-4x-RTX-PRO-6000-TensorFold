@@ -129,7 +129,7 @@ for host, port in ((sys.argv[1], int(sys.argv[2])), ("127.0.0.1", int(sys.argv[3
 PY
 fi
 
-step 2 'Build the pinned TensorFold image with all 151 engine patches (skip when ready)'
+step 2 'Build the pinned TensorFold image with all 152 engine patches (skip when ready)'
 prepare_image
 step 3 'Download the pinned checkpoint and DSpark drafter (skip when ready)'
 prepare_weights
